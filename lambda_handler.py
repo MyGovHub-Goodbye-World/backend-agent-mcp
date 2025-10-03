@@ -4,7 +4,61 @@ import uuid
 from datetime import datetime, timezone
 import traceback
 
-from main import run_agent
+import boto3
+from botocore.exceptions import ClientError
+
+# optional dotenv already handled earlier in this file; ensure environment loaded
+try:
+    import dotenv  # type: ignore
+    dotenv.load_dotenv()
+except Exception:
+    pass
+
+# Create a Bedrock Runtime client
+_bedrock_client = boto3.client(
+    "bedrock-runtime",
+    region_name=(os.getenv("AWS_REGION1") or "us-east-1")
+)
+
+# Set the model ID (override with env var BEDROCK_MODEL_ID)
+_model_id = os.getenv("BEDROCK_MODEL_ID") or "amazon.nova-lite-v1:0"
+
+
+def run_agent(
+    prompt: str,
+    max_tokens: int = int(os.getenv("BEDROCK_MAX_TOKENS", 512)),
+    temperature: float = float(os.getenv("BEDROCK_TEMPERATURE", 0.5)),
+    top_p: float = float(os.getenv("BEDROCK_TOP_P", 0.8)),
+) -> str:
+    """Send `prompt` to Bedrock converse and return the text response.
+
+    Inputs:
+        - prompt: user prompt string
+        - max_tokens, temperature, top_p: inference config
+
+    Returns:
+        - response text from the model
+    """
+    conversation = [
+        {
+            "role": "user",
+            "content": [{"text": prompt}]
+        }
+    ]
+
+    try:
+        response = _bedrock_client.converse(
+            modelId=_model_id,
+            messages=conversation,
+            inferenceConfig={"maxTokens": max_tokens, "temperature": temperature, "topP": top_p},
+        )
+
+        # Extract the response text. The response shape follows the Bedrock Runtime converse API.
+        response_text = response["output"]["message"]["content"][0]["text"]
+        return response_text
+
+    except (ClientError, Exception) as e:
+        raise RuntimeError(f"ERROR: Can't invoke '{_model_id}'. Reason: {e}")
 
 # Optional dotenv for local development
 try:
@@ -15,6 +69,34 @@ except Exception:
 
 # pymongo is required: failing to import will cause the Lambda to fail to initialize
 import pymongo  # type: ignore
+
+# CORS defaults for browser clients (keeps it permissive for local testing/origins)
+CORS_HEADERS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Requested-With',
+    'Access-Control-Allow-Credentials': 'false',
+}
+
+
+def _cors_response(status_code=200, body=None, content_type='application/json'):
+    """Utility to build a response that always includes CORS headers.
+
+    body may be a dict/list (will be JSON-encoded) or a string. If body is None,
+    an empty string body will be returned (useful for OPTIONS preflight 204 responses).
+    """
+    headers = {'Content-Type': content_type}
+    headers.update(CORS_HEADERS)
+    resp = {'statusCode': status_code, 'headers': headers}
+    if body is None:
+        resp['body'] = ''
+    else:
+        # If caller passed a dict/list, encode to JSON; otherwise coerce to string
+        if isinstance(body, (dict, list)):
+            resp['body'] = json.dumps(body)
+        else:
+            resp['body'] = str(body)
+    return resp
 
 def _connect_mongo():
     """Create a MongoDB client using ATLAS_URI from env.
@@ -67,12 +149,13 @@ def lambda_handler(event, context):
     if not method:
         method = event.get('httpMethod')
 
+    # Handle CORS preflight early: respond to OPTIONS with proper headers
+    if method and method.upper() == 'OPTIONS':
+        # 204 No Content is a lightweight preflight response
+        return _cors_response(204, None)
+
     if path and path.endswith('/health') and (method or '').upper() == 'GET':
-        return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({'status': 'ok'})
-        }
+        return _cors_response(200, {'status': 'ok'})
 
     # Parse body for regular requests
     body = event.get('body')
@@ -80,18 +163,10 @@ def lambda_handler(event, context):
         try:
             body = json.loads(body)
         except Exception:
-            return {
-                'statusCode': 400,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({'error': 'Invalid JSON body'})
-            }
+            return _cors_response(400, {'error': 'Invalid JSON body'})
 
     if not isinstance(body, dict):
-        return {
-            'statusCode': 400,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({'error': 'Request body must be a JSON object'})
-        }
+        return _cors_response(400, {'error': 'Request body must be a JSON object'})
 
     # Validate required fields
     user_id = body.get('userId')
@@ -100,11 +175,7 @@ def lambda_handler(event, context):
     ekyc = body.get('ekyc') or {}
 
     if not user_id or not message or session_id is None:
-        return {
-            'statusCode': 400,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({'error': "Missing required fields: 'userId', 'message', or 'sessionId'"})
-        }
+        return _cors_response(400, {'error': "Missing required fields: 'userId', 'message', or 'sessionId'"})
 
     # Generate a messageId for this incoming message
     message_id = str(uuid.uuid4())
@@ -118,11 +189,7 @@ def lambda_handler(event, context):
     try:
         client = _connect_mongo()
     except RuntimeError as e:
-        return {
-            'statusCode': 500,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({'error': str(e)}),
-        }
+        return _cors_response(500, {'error': str(e)})
 
     try:
         db = client['chats']
@@ -222,11 +289,7 @@ def lambda_handler(event, context):
                     client2.close()
             except Exception:
                 pass
-            return {
-                'statusCode': 500,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({'error': f'Failed to persist conversation: {str(e)}', 'trace': tb}),
-            }
+            return _cors_response(500, {'error': f'Failed to persist conversation: {str(e)}', 'trace': tb})
         finally:
             try:
                 if 'client2' in locals() and client2:
@@ -249,18 +312,11 @@ def lambda_handler(event, context):
         if model_error:
             resp_body['data']['modelError'] = model_error
 
-        return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps(resp_body)
-        }
+        # successful response
+        return _cors_response(200, resp_body)
     except Exception as e:
         # print traceback to CloudWatch and return it in the response for easier debugging
         tb = traceback.format_exc()
         print('Handler exception:', str(e))
         print(tb)
-        return {
-            'statusCode': 500,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({'error': str(e), 'trace': tb}),
-        }
+        return _cors_response(500, {'error': str(e), 'trace': tb})

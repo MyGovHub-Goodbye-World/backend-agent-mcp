@@ -25,6 +25,22 @@ provider:
             - bedrock:DescribeModel
           Resource:
             - arn:aws:bedrock:${env:AWS_REGION1, 'us-east-1'}::foundation-model/*
+  # HTTP API-level settings (CORS) so browser clients can call the endpoints directly.
+  httpApi:
+    cors:
+      allowOrigins:
+        - '*'
+      allowMethods:
+        - GET
+        - POST
+        - OPTIONS
+      allowHeaders:
+        - Content-Type
+        - Authorization
+        - X-Requested-With
+      exposeHeaders:
+        - Content-Length
+      allowCredentials: false
 
 functions:
   agent-mcp:
@@ -45,7 +61,6 @@ plugins:
 package:
   patterns:
     - '!**/*'
-    - 'main.py'
     - 'bedrock-runtime.py'
     - 'lambda_handler.py'
     - 'requirements.txt'
