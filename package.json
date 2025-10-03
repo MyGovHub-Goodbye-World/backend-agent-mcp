@@ -1,0 +1,13 @@
+{
+  "name": "agent-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "deploy": "serverless deploy",
+    "deploy:npx": "npx serverless deploy"
+  },
+  "devDependencies": {
+    "serverless": "^3.40.0",
+    "serverless-python-requirements": "^5.1.0"
+  }
+}

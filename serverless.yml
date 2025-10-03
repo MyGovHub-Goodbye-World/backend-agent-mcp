@@ -1,0 +1,48 @@
+service: agent-mcp
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  stage: ${opt:stage, 'dev'}
+  runtime: python3.11
+  region: ${env:AWS_REGION1, 'us-east-1'}
+  environment:
+    BEDROCK_MODEL_ID: ${env:BEDROCK_MODEL_ID, 'amazon.nova-lite-v1:0'}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - bedrock:InvokeModel
+            - bedrock:StartModelInvocation
+            - bedrock:DescribeModel
+          Resource:
+            - arn:aws:bedrock:${env:AWS_REGION1, 'us-east-1'}::foundation-model/*
+
+functions:
+  agent-mcp:
+    handler: lambda_handler.lambda_handler
+    events:
+      - httpApi:
+          path: /${self:provider.stage}/health
+          method: get
+      - httpApi:
+          path: /${self:provider.stage}/agent-mcp
+          method: post
+
+plugins:
+  - serverless-python-requirements
+
+package:
+  patterns:
+    - '!**/*'
+    - 'main.py'
+    - 'bedrock-runtime.py'
+    - 'lambda_handler.py'
+    - 'requirements.txt'
+
+custom:
+  pythonRequirements:
+    dockerizePip: false
+    zip: false
