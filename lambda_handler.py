@@ -108,7 +108,10 @@ def lambda_handler(event, context):
 
     # Generate a messageId for this incoming message
     message_id = str(uuid.uuid4())
-    created_at = datetime.now(timezone.utc).isoformat()
+    # createdAt: UTC with millisecond precision and trailing Z, e.g. 2025-10-02T01:03:00.000Z
+    dt = datetime.now(timezone.utc)
+    created_at_iso = dt.isoformat()
+    created_at_z = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
     # If new session, create sessionId and initialize collection/document in MongoDB (required)
     new_session_generated = None
@@ -136,7 +139,7 @@ def lambda_handler(event, context):
             # Prepare the session document format
             session_doc = {
                 'sessionId': new_session_generated,
-                'createdAt': created_at,
+                'createdAt': created_at_iso,
                 'messages': [],
                 'status': 'active',
                 'topic': '',
@@ -230,7 +233,7 @@ def lambda_handler(event, context):
             'data': {
                 'messageId': message_id,
                 'message': response_text if response_text is not None else 'ERROR: assistant failed to respond',
-                'createdAt': created_at,
+                'createdAt': created_at_z,
                 'sessionId': session_to_update,
                 'attachment': body.get('attachment') or []
             }
