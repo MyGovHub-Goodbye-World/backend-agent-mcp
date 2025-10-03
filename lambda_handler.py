@@ -108,6 +108,7 @@ def lambda_handler(event, context):
 
     # Generate a messageId for this incoming message
     message_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
 
     # If new session, create sessionId and initialize collection/document in MongoDB (required)
     new_session_generated = None
@@ -135,7 +136,7 @@ def lambda_handler(event, context):
             # Prepare the session document format
             session_doc = {
                 'sessionId': new_session_generated,
-                'createdAt': datetime.now(timezone.utc).isoformat(),
+                'createdAt': created_at,
                 'messages': [],
                 'status': 'active',
                 'topic': '',
@@ -162,11 +163,13 @@ def lambda_handler(event, context):
     try:
         if session_id == '(new-session)':
             prompt = (
-                "You are an assistant that composes a short friendly welcome message for a government services"
-                "portal called MyGovHub. Mention that MyGovHub provides services such as license renewal,"
-                "TnB bill payments, permit applications, checking application status, and accessing official"
-                "documents. Keep the message concise, helpful, and include a brief call-to-action inviting"""
-                "the user to ask for assistance or begin a task (e.g., 'How can I help you today?')."
+                "SYSTEM: You are a friendly assistant that composes a short welcome message "
+                "for a government services portal called MyGovHub. The message MUST mention "
+                "that MyGovHub provides these services: license renewal, bill payments, "
+                "permit applications, checking application status, and accessing official documents. "
+                "Keep it concise (max ~120 words), helpful, and end with a call-to-action such as "
+                "'How can I help you today?'.\n\n"
+                "IMPORTANT: Respond ONLY with the welcome message text (no JSON, no explanations, no metadata)."
             )
         else:
             # For regular messages, pass through the user's message to the model
@@ -227,6 +230,7 @@ def lambda_handler(event, context):
             'data': {
                 'messageId': message_id,
                 'message': response_text if response_text is not None else 'ERROR: assistant failed to respond',
+                'createdAt': created_at,
                 'sessionId': session_to_update,
                 'attachment': body.get('attachment') or []
             }
