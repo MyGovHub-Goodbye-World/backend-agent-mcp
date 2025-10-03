@@ -18,9 +18,9 @@ model_id = os.getenv("BEDROCK_MODEL_ID") or "amazon.nova-lite-v1:0"
 
 def run_agent(
     prompt: str,
-    max_tokens: int = os.getenv("BEDROCK_MAX_TOKENS", 512),
-    temperature: float = os.getenv("BEDROCK_TEMPERATURE", 0.5),
-    top_p: float = os.getenv("BEDROCK_TOP_P", 0.8)
+    max_tokens: int = int(os.getenv("BEDROCK_MAX_TOKENS", 512)),
+    temperature: float = float(os.getenv("BEDROCK_TEMPERATURE", 0.5)),
+    top_p: float = float(os.getenv("BEDROCK_TOP_P", 0.8))
 ) -> str:
     """Send `prompt` to Bedrock converse and return the text response.
 

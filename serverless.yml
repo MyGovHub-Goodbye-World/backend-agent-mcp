@@ -9,6 +9,12 @@ provider:
   region: ${env:AWS_REGION1, 'us-east-1'}
   environment:
     BEDROCK_MODEL_ID: ${env:BEDROCK_MODEL_ID, 'amazon.nova-lite-v1:0'}
+    BEDROCK_MAX_TOKENS: ${env:BEDROCK_MAX_TOKENS, 512}
+    BEDROCK_TEMPERATURE: ${env:BEDROCK_TEMPERATURE, 0.5}
+    BEDROCK_TOP_P: ${env:BEDROCK_TOP_P, 0.8}
+
+    ATLAS_URI: ${env:ATLAS_URI}
+    ATLAS_DB: ${env:ATLAS_DB, 'databases'}
   iam:
     role:
       statements:

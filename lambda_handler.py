@@ -2,35 +2,35 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+
 from main import run_agent
 
-# Optional MongoDB support: only perform DB ops when pymongo is available.
+# Optional dotenv for local development
 try:
-    import pymongo
-    MONGO_AVAILABLE = True
+    import dotenv  # type: ignore
+    dotenv.load_dotenv()
 except Exception:
-    pymongo = None
-    MONGO_AVAILABLE = False
+    dotenv = None
 
+# pymongo is required: failing to import will cause the Lambda to fail to initialize
+import pymongo  # type: ignore
 
 def _connect_mongo():
-    """Create a MongoDB client using ATLAS_URI from env if available.
+    """Create a MongoDB client using ATLAS_URI from env.
 
-    Returns (db, client) or (None, None) if connection cannot be established.
+    Raises RuntimeError if ATLAS_URI is missing or the connection cannot be established.
+    Returns a pymongo.MongoClient on success.
     """
-    if not MONGO_AVAILABLE:
-        return None, None
     atlas_uri = os.getenv('ATLAS_URI')
     if not atlas_uri:
-        return None, None
+        raise RuntimeError('ATLAS_URI environment variable is not set')
     try:
         client = pymongo.MongoClient(atlas_uri, serverSelectionTimeoutMS=5000)
         # attempt server selection
         client.admin.command('ping')
-        db = "chats"
-        return db, client
-    except Exception:
-        return None, None
+        return client
+    except Exception as e:
+        raise RuntimeError(f'Failed to connect to MongoDB: {e}')
 
 
 def lambda_handler(event, context):
@@ -108,10 +108,27 @@ def lambda_handler(event, context):
     # Generate a messageId for this incoming message
     message_id = str(uuid.uuid4())
 
-    # If new session, create sessionId and initialize collection/document in MongoDB if available
+    # If new session, create sessionId and initialize collection/document in MongoDB (required)
     new_session_generated = None
-    db, client = _connect_mongo()
     try:
+        client = _connect_mongo()
+    except RuntimeError as e:
+        return {
+            'statusCode': 500,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({'error': str(e)}),
+        }
+
+    try:
+        db = client['chats']
+        # Ensure the user's collection exists; create if missing
+        if user_id not in db.list_collection_names():
+            try:
+                db.create_collection(user_id)
+            except Exception:
+                # If collection creation fails, it may already exist (race) or be unsupported
+                pass
+        coll = db[user_id]
         if session_id == '(new-session)':
             new_session_generated = str(uuid.uuid4())
             # Prepare the session document format
@@ -124,27 +141,20 @@ def lambda_handler(event, context):
                 'context': {},
                 'ekyc': ekyc or {}
             }
-            if db is not None:
-                coll_name = user_id
-                coll = db[coll_name]
-                # Insert the document if a session with same id does not exist
-                coll.insert_one(session_doc)
+            # Insert the document
+            coll.insert_one(session_doc)
         else:
-            # existing session: update ekyc if provided and append message record to messages
-            if db is not None and session_id:
-                coll_name = user_id
-                coll = db[coll_name]
-                update_ops = {}
-                if ekyc:
-                    update_ops['ekyc'] = ekyc
-                if update_ops:
-                    coll.update_one({'sessionId': session_id}, {'$set': update_ops})
+            # existing session: update ekyc if provided
+            update_ops = {}
+            if ekyc:
+                update_ops['ekyc'] = ekyc
+            if update_ops:
+                coll.update_one({'sessionId': session_id}, {'$set': update_ops})
     finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
+        try:
+            client.close()
+        except Exception:
+            pass
 
     # Determine prompt for Bedrock. For first-time connection, request a welcome message.
     try:
