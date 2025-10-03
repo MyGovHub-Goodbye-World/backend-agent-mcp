@@ -136,6 +136,13 @@ def lambda_handler(event, context):
         coll = db[user_id]
         if session_id == '(new-session)':
             new_session_generated = str(uuid.uuid4())
+            # Archive any other active sessions for this user
+            try:
+                coll.update_many({'status': 'active'}, {'$set': {'status': 'archived'}})
+            except Exception:
+                # Non-fatal: continue even if archiving fails (race or permissions)
+                pass
+
             # Prepare the session document format
             session_doc = {
                 'sessionId': new_session_generated,
