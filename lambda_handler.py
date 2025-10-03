@@ -2,6 +2,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+import traceback
 
 from main import run_agent
 
@@ -157,28 +158,82 @@ def lambda_handler(event, context):
             pass
 
     # Determine prompt for Bedrock. For first-time connection, request a welcome message.
+    # Determine prompt for Bedrock. For first-time connection, request a welcome message.
     try:
         if session_id == '(new-session)':
             prompt = (
-                "You are an assistant that composes a short friendly welcome message for a "
-                "government services portal called MyGovHub. Keep it concise and helpful."
+                "You are an assistant that composes a short friendly welcome message for a government services"
+                "portal called MyGovHub. Mention that MyGovHub provides services such as license renewal,"
+                "TnB bill payments, permit applications, checking application status, and accessing official"
+                "documents. Keep the message concise, helpful, and include a brief call-to-action inviting"""
+                "the user to ask for assistance or begin a task (e.g., 'How can I help you today?')."
             )
         else:
             # For regular messages, pass through the user's message to the model
             prompt = message
 
-        response_text = run_agent(prompt)
+        model_error = None
+        response_text = None
+        try:
+            response_text = run_agent(prompt)
+        except Exception as model_exc:
+            # Record the model failure but continue — we'll persist an assistant error message
+            model_error = str(model_exc)
+            print('Model invocation failed:', model_error)
 
-        # Prepare the MCP response payload
+        # Persist the conversation: always push user message first, then assistant or error message
+        session_to_update = new_session_generated if new_session_generated else session_id
+        try:
+            client2 = _connect_mongo()
+            db2 = client2['chats']
+            coll2 = db2[user_id]
+
+            # push the user message (always)
+            user_msg_doc = {'role': 'user', 'content': [{'text': str(message)}]}
+            coll2.update_one({'sessionId': session_to_update}, {'$push': {'messages': user_msg_doc}}, upsert=True)
+
+            # push the assistant message; if model failed, store an error message as assistant reply
+            if response_text is not None:
+                assistant_msg_doc = {'role': 'assistant', 'content': [{'text': str(response_text)}]}
+            else:
+                assistant_msg_doc = {'role': 'assistant', 'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}], 'meta': {'modelError': model_error}}
+
+            coll2.update_one({'sessionId': session_to_update}, {'$push': {'messages': assistant_msg_doc}}, upsert=True)
+        except Exception as e:
+            # If persisting conversation fails, return 500 to enforce durability and include traceback for debugging
+            tb = traceback.format_exc()
+            print('Failed to persist conversation:', str(e))
+            print(tb)
+            try:
+                if 'client2' in locals() and client2:
+                    client2.close()
+            except Exception:
+                pass
+            return {
+                'statusCode': 500,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': f'Failed to persist conversation: {str(e)}', 'trace': tb}),
+            }
+        finally:
+            try:
+                if 'client2' in locals() and client2:
+                    client2.close()
+            except Exception:
+                pass
+
+        # Prepare the MCP response payload. If model failed, still return 200 but include modelError flag
         resp_body = {
             'status': {'statusCode': 200, 'message': 'Success'},
             'data': {
                 'messageId': message_id,
-                'message': response_text,
-                'sessionId': new_session_generated if new_session_generated else session_id,
+                'message': response_text if response_text is not None else 'ERROR: assistant failed to respond',
+                'sessionId': session_to_update,
                 'attachment': body.get('attachment') or []
             }
         }
+
+        if model_error:
+            resp_body['data']['modelError'] = model_error
 
         return {
             'statusCode': 200,
@@ -186,8 +241,12 @@ def lambda_handler(event, context):
             'body': json.dumps(resp_body)
         }
     except Exception as e:
+        # print traceback to CloudWatch and return it in the response for easier debugging
+        tb = traceback.format_exc()
+        print('Handler exception:', str(e))
+        print(tb)
         return {
             'statusCode': 500,
             'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({'error': str(e)})
+            'body': json.dumps({'error': str(e), 'trace': tb}),
         }

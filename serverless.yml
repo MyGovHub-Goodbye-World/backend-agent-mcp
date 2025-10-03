@@ -1,6 +1,6 @@
 service: agent-mcp
 
-frameworkVersion: '3'
+frameworkVersion: '4'
 
 provider:
   name: aws
@@ -29,6 +29,8 @@ provider:
 functions:
   agent-mcp:
     handler: lambda_handler.lambda_handler
+    memorySize: 2048
+    timeout: 30
     events:
       - httpApi:
           path: /${self:provider.stage}/health
@@ -50,5 +52,5 @@ package:
 
 custom:
   pythonRequirements:
-    dockerizePip: false
+    dockerizePip: true
     zip: false
