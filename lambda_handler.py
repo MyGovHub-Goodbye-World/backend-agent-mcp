@@ -374,6 +374,8 @@ def _generate_document_analysis_prompt(ocr_result, user_message):
             prompt_parts.append("User uploaded a document without additional message.")
         prompt_parts.append("")
         prompt_parts.append("Please provide a helpful response based on the document analysis and user's needs. Be specific about what MyGovHub services might be relevant.")
+        prompt_parts.append("")
+        prompt_parts.append("NOTE: If you include a signature, use 'MyGovHub Support Team' only. Do not use placeholders like '[Your Name]' or similar.")
         
         return '\n'.join(prompt_parts)
         
