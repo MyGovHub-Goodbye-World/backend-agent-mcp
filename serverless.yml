@@ -18,7 +18,7 @@ provider:
     OCR_ANALYZE_API_URL: ${env:OCR_ANALYZE_API_URL}
 
     ATLAS_URI: ${env:ATLAS_URI}
-    ATLAS_DB: ${env:ATLAS_DB, 'databases'}
+    ATLAS_DB_NAME: ${env:ATLAS_DB_NAME, 'databases'}
   iam:
     role:
       statements:

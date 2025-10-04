@@ -235,7 +235,12 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
     if service_name == 'renew_license':
         db_name = os.getenv('ATLAS_DB_NAME') or ''
         if not db_name:
-            return ("License verification complete, but database name not configured. Please set ATLAS_DB_NAME environment variable.")
+            logger.error("License verification complete, but database name not configured. Please set ATLAS_DB_NAME environment variable.")
+            return (
+                "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+                "USER-FACING MESSAGE:\n"
+                "Identity verified, but I couldn't retrieve your license record right now. Please try again shortly or provide more details."
+            )
         license_record = None
         record_for_context = None
         try:
@@ -299,9 +304,10 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
         return (
             "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
             "USER-FACING MESSAGE:\n"
-            f"We found your driving license record (License No: {license_number or 'N/A'})."
-            f"Valid from: {valid_from or 'N/A'}, Valid to: {valid_to or 'N/A'}. "
-            f"Status: {status.upper()}."
+            "We found your driving license record:\n\n"
+            f"License No: {license_number or 'N/A'}).\n"
+            f"Valid from: {valid_from or 'N/A'} to {valid_to or 'N/A'}.\n"
+            f"Status: {status.upper()}.\n\n"
             "I can help extend your license validity. Are you sure you want to proceed with renewal?"
         )
 
@@ -1544,219 +1550,220 @@ def lambda_handler(event, context):
                 intent_type = f'service_{active_service}_next'
             if _should_log():
                 logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
+            
         else:
-        if _should_log():
-            logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
+            if _should_log():
+                logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
 
-        if session_id == '(new-session)':
-            # For first-time connection, request a welcome message.
-            prompt = (
-                "SYSTEM: You are a friendly assistant that composes a short welcome message "
-                "for a government services portal called MyGovHub. The message MUST mention "
-                "that MyGovHub provides these services: license renewal, bill payments, "
-                "permit applications, checking application status, and accessing official documents. "
-                "Keep it concise (max ~120 words), helpful, and end with a call-to-action such as "
-                "'How can I help you today?'.\n\n"
-                "IMPORTANT: Respond ONLY with the welcome message text (no JSON, no explanations, no metadata)."
-            )
-        elif intent_type == 'document_processing' and ocr_result:
-            # Use document analysis prompt for processed documents
-            prompt = _generate_document_analysis_prompt(ocr_result, message)
-        elif intent_type == 'document_verified':
-            # Post-verification: intentionally no special prompt; generic context builder will handle.
-            # Keeping an explicit no-op to avoid accidental fall-through confusion.
-            pass
-        elif intent_type == 'document_correction_needed':
-            # User said the information is wrong, ask for specifics
-            extracted_data = unverified_doc_data.get('extractedData', {}) if unverified_doc_data else {}
-            
-            # Generate field examples based on actual OCR API fields
-            field_mapping = {
-                'full_name': 'Full Name',
-                'userId': 'IC Number',
-                'gender': 'Gender', 
-                'address': 'Address',
-                'licenses_number': 'License Number',
-                'account_number': 'Account Number',
-                'invoice_number': 'Invoice Number'
-            }
-            
-            field_examples = []
-            for field_key, field_value in extracted_data.items():
-                friendly_name = field_mapping.get(field_key, field_key.replace('_', ' ').title())
-                field_examples.append(f"{friendly_name}: [correct {friendly_name.lower()}]")
-            
-            format_example = '\n'.join(field_examples) if field_examples else "Field Name: [correct value]"
-            data_summary = '\n'.join([f'- {field_mapping.get(key, key.replace("_", " ").title())}: {value}' for key, value in extracted_data.items()])
-            
-            # Include full document context for AI understanding
-            doc_context = json.dumps(unverified_doc_data, indent=2, default=str) if unverified_doc_data else "{}"
-            
-            prompt = (
-                "SYSTEM: The user said 'No' which means the extracted document information is INCORRECT. "
-                "You MUST ask them to specify which fields are wrong and provide corrections. "
-                "DO NOT proceed with the current data - the user explicitly said it's wrong. "
-                "\nFull document context (for AI reference):\n"
-                f"{doc_context}\n\n"
-                "Current extracted data (user said this is WRONG):\n"
-                f"{data_summary}\n\n"
-                "REQUIRED RESPONSE: Ask the user exactly this:\n"
-                "'I understand the information is incorrect. Which fields need to be corrected? "
-                "Please provide the correct details in this format:\n\n"
-                f"{format_example}\n\n"
-                "You can correct multiple fields at once.'\n\n"
-                f"User message: {message}\n\n"
-                "NOTE: userId represents the Identity Card (IC) number. If you include a signature, use 'MyGovHub Support Team' only."
-            )
-        elif intent_type == 'document_correction_provided':
-            # User has provided corrections, show updated info and ask for confirmation
-            # Get the updated document data after corrections
-            try:
-                client_refresh = _connect_mongo()
-                db_refresh = client_refresh['chats']
-                coll_refresh = db_refresh[user_id]
-                session_to_get = new_session_generated if new_session_generated else session_id
-                updated_session = coll_refresh.find_one({'sessionId': session_to_get})
+            if session_id == '(new-session)':
+                # For first-time connection, request a welcome message.
+                prompt = (
+                    "SYSTEM: You are a friendly assistant that composes a short welcome message "
+                    "for a government services portal called MyGovHub. The message MUST mention "
+                    "that MyGovHub provides these services: license renewal, bill payments, "
+                    "permit applications, checking application status, and accessing official documents. "
+                    "Keep it concise (max ~120 words), helpful, and end with a call-to-action such as "
+                    "'How can I help you today?'.\n\n"
+                    "IMPORTANT: Respond ONLY with the welcome message text (no JSON, no explanations, no metadata)."
+                )
+            elif intent_type == 'document_processing' and ocr_result:
+                # Use document analysis prompt for processed documents
+                prompt = _generate_document_analysis_prompt(ocr_result, message)
+            elif intent_type == 'document_verified':
+                # Post-verification: intentionally no special prompt; generic context builder will handle.
+                # Keeping an explicit no-op to avoid accidental fall-through confusion.
+                pass
+            elif intent_type == 'document_correction_needed':
+                # User said the information is wrong, ask for specifics
+                extracted_data = unverified_doc_data.get('extractedData', {}) if unverified_doc_data else {}
                 
-                if updated_session and unverified_doc_key in updated_session.get('context', {}):
-                    updated_data = updated_session['context'][unverified_doc_key].get('extractedData', {})
+                # Generate field examples based on actual OCR API fields
+                field_mapping = {
+                    'full_name': 'Full Name',
+                    'userId': 'IC Number',
+                    'gender': 'Gender', 
+                    'address': 'Address',
+                    'licenses_number': 'License Number',
+                    'account_number': 'Account Number',
+                    'invoice_number': 'Invoice Number'
+                }
+                
+                field_examples = []
+                for field_key, field_value in extracted_data.items():
+                    friendly_name = field_mapping.get(field_key, field_key.replace('_', ' ').title())
+                    field_examples.append(f"{friendly_name}: [correct {friendly_name.lower()}]")
+                
+                format_example = '\n'.join(field_examples) if field_examples else "Field Name: [correct value]"
+                data_summary = '\n'.join([f'- {field_mapping.get(key, key.replace("_", " ").title())}: {value}' for key, value in extracted_data.items()])
+                
+                # Include full document context for AI understanding
+                doc_context = json.dumps(unverified_doc_data, indent=2, default=str) if unverified_doc_data else "{}"
+                
+                prompt = (
+                    "SYSTEM: The user said 'No' which means the extracted document information is INCORRECT. "
+                    "You MUST ask them to specify which fields are wrong and provide corrections. "
+                    "DO NOT proceed with the current data - the user explicitly said it's wrong. "
+                    "\nFull document context (for AI reference):\n"
+                    f"{doc_context}\n\n"
+                    "Current extracted data (user said this is WRONG):\n"
+                    f"{data_summary}\n\n"
+                    "REQUIRED RESPONSE: Ask the user exactly this:\n"
+                    "'I understand the information is incorrect. Which fields need to be corrected? "
+                    "Please provide the correct details in this format:\n\n"
+                    f"{format_example}\n\n"
+                    "You can correct multiple fields at once.'\n\n"
+                    f"User message: {message}\n\n"
+                    "NOTE: userId represents the Identity Card (IC) number. If you include a signature, use 'MyGovHub Support Team' only."
+                )
+            elif intent_type == 'document_correction_provided':
+                # User has provided corrections, show updated info and ask for confirmation
+                # Get the updated document data after corrections
+                try:
+                    client_refresh = _connect_mongo()
+                    db_refresh = client_refresh['chats']
+                    coll_refresh = db_refresh[user_id]
+                    session_to_get = new_session_generated if new_session_generated else session_id
+                    updated_session = coll_refresh.find_one({'sessionId': session_to_get})
                     
+                    if updated_session and unverified_doc_key in updated_session.get('context', {}):
+                        updated_data = updated_session['context'][unverified_doc_key].get('extractedData', {})
+                        
+                        if _should_log():
+                            logger.info('Retrieved updated data after corrections: %s', updated_data)
+                        
+                        # Use field mapping for user-friendly display
+                        field_mapping = {
+                            'full_name': 'Full Name',
+                            'userId': 'IC Number',
+                            'gender': 'Gender', 
+                            'address': 'Address',
+                            'licenses_number': 'License Number',
+                            'account_number': 'Account Number',
+                            'invoice_number': 'Invoice Number'
+                        }
+                        
+                        # If there are pending corrections (correctedData), overlay them for display only
+                        corrected_preview = updated_session['context'][unverified_doc_key].get('correctedData') or {}
+                        preview_data = dict(updated_data)
+                        preview_data.update(corrected_preview)  # overlay pending corrections
+                        formatted_data = []
+                        for key, value in preview_data.items():
+                            friendly_name = field_mapping.get(key, key.replace('_', ' ').title())
+                            formatted_data.append(f'- {friendly_name}: {value}')
+                        
+                        data_summary = '\n'.join(formatted_data)
+                        
+                        # Include full updated document context for AI reference
+                        updated_doc_context = updated_session['context'][unverified_doc_key]
+                        doc_context = json.dumps(updated_doc_context, indent=2, default=str)
+                        
+                        prompt = (
+                            "SYSTEM: The user has provided corrections. Show ONLY the updated information with pending corrections overlaid (not yet finalized) and ask for confirmation. "
+                            "DO NOT include technical details like timestamps, filenames, confidence scores, or verification status. "
+                            "Show ONLY the user-visible data.\n\n"
+                            "Updated information (including proposed corrections) to show user:\n"
+                            f"{data_summary}\n\n"
+                            "REQUIRED RESPONSE FORMAT:\n"
+                            "Thank you for the corrections. Here is the updated information (pending your confirmation):\n\n"
+                            f"{data_summary}\n\n"
+                            "Is this corrected information now accurate? Please reply YES to confirm.\n\n"
+                            "MyGovHub Support Team\n\n"
+                            f"User message: {message}\n\n"
+                            "NOTE: userId represents the Identity Card (IC) number. Keep response simple and user-friendly."
+                        )
+                    else:
+                        prompt = f"SYSTEM: Error retrieving updated document data. User message: {message}"
+                        
+                    client_refresh.close()
+                except Exception as e:
+                    prompt = f"SYSTEM: Error processing corrections. User message: {message}"
                     if _should_log():
-                        logger.info('Retrieved updated data after corrections: %s', updated_data)
-                    
-                    # Use field mapping for user-friendly display
-                    field_mapping = {
-                        'full_name': 'Full Name',
-                        'userId': 'IC Number',
-                        'gender': 'Gender', 
-                        'address': 'Address',
-                        'licenses_number': 'License Number',
-                        'account_number': 'Account Number',
-                        'invoice_number': 'Invoice Number'
-                    }
-                    
-                    # If there are pending corrections (correctedData), overlay them for display only
-                    corrected_preview = updated_session['context'][unverified_doc_key].get('correctedData') or {}
-                    preview_data = dict(updated_data)
-                    preview_data.update(corrected_preview)  # overlay pending corrections
-                    formatted_data = []
-                    for key, value in preview_data.items():
-                        friendly_name = field_mapping.get(key, key.replace('_', ' ').title())
-                        formatted_data.append(f'- {friendly_name}: {value}')
-                    
-                    data_summary = '\n'.join(formatted_data)
-                    
-                    # Include full updated document context for AI reference
-                    updated_doc_context = updated_session['context'][unverified_doc_key]
-                    doc_context = json.dumps(updated_doc_context, indent=2, default=str)
-                    
-                    prompt = (
-                        "SYSTEM: The user has provided corrections. Show ONLY the updated information with pending corrections overlaid (not yet finalized) and ask for confirmation. "
-                        "DO NOT include technical details like timestamps, filenames, confidence scores, or verification status. "
-                        "Show ONLY the user-visible data.\n\n"
-                        "Updated information (including proposed corrections) to show user:\n"
-                        f"{data_summary}\n\n"
-                        "REQUIRED RESPONSE FORMAT:\n"
-                        "Thank you for the corrections. Here is the updated information (pending your confirmation):\n\n"
-                        f"{data_summary}\n\n"
-                        "Is this corrected information now accurate? Please reply YES to confirm.\n\n"
-                        "MyGovHub Support Team\n\n"
-                        f"User message: {message}\n\n"
-                        "NOTE: userId represents the Identity Card (IC) number. Keep response simple and user-friendly."
-                    )
-                else:
-                    prompt = f"SYSTEM: Error retrieving updated document data. User message: {message}"
-                    
-                client_refresh.close()
-            except Exception as e:
-                prompt = f"SYSTEM: Error processing corrections. User message: {message}"
-                if _should_log():
-                    logger.error('Failed to retrieve updated document data: %s', str(e))
-        elif intent_type == 'renew_license':
-            prompt = (
-                "SYSTEM: Respond with ONLY the following guidance (no extra elaboration beyond minor natural phrasing allowed).\n\n"
-                "USER-FACING MESSAGE:\n"
-                "I can help you renew your driving license!\n\n"
-                "To proceed with the renewal, I need to verify your identity and current license details. Please upload one of the following documents:\n\n"
-                "📸 Option 1: Your current driving license (photo of the front side)\n"
-                "📸 Option 2: Your IC (Identity Card) - front side\n\n"
-                "Please take a clear photo and send it to me. I'll extract the necessary information to process your license renewal.\n"
-                "If you already uploaded a document earlier and it's verified, just reply YES to proceed with renewal steps."
-            )
-        elif intent_type == 'pay_tnb_bill':
-            prompt = (
-                "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-                "USER-FACING MESSAGE:\n"
-                "I can help you pay your TNB electricity bill! ⚡\n\n"
-                "To process your bill payment, I need to verify your account details and bill information. Please upload:\n\n"
-                "📸 TNB Bill Document: Take a photo of your TNB bill (the upper portion showing your account number and amount due)\n\n"
-                "Please ensure the photo is clear and all important details are visible. I'll extract the account information to help you with the payment process."
-            )
-        else:
-            # Generic context-building order: 1) Document context summary 2) EKYC 3) Prior messages 4) Current user message
-            parts = []
-            # 1. Document/context summary (only high-level; avoid dumping huge raw objects)
-            if session_doc:
-                ctx = session_doc.get('context') or {}
-                if ctx:
-                    # Summarize each document entry: ref + verification + key fields
+                        logger.error('Failed to retrieve updated document data: %s', str(e))
+            elif intent_type == 'renew_license':
+                prompt = (
+                    "SYSTEM: Respond with ONLY the following guidance (no extra elaboration beyond minor natural phrasing allowed).\n\n"
+                    "USER-FACING MESSAGE:\n"
+                    "I can help you renew your driving license!\n\n"
+                    "To proceed with the renewal, I need to verify your identity and current license details. Please upload one of the following documents:\n\n"
+                    "📸 Option 1: Your current driving license (photo of the front side)\n"
+                    "📸 Option 2: Your IC (Identity Card) - front side\n\n"
+                    "Please take a clear photo and send it to me. I'll extract the necessary information to process your license renewal.\n"
+                    "If you already uploaded a document earlier and it's verified, just reply YES to proceed with renewal steps."
+                )
+            elif intent_type == 'pay_tnb_bill':
+                prompt = (
+                    "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+                    "USER-FACING MESSAGE:\n"
+                    "I can help you pay your TNB electricity bill! ⚡\n\n"
+                    "To process your bill payment, I need to verify your account details and bill information. Please upload:\n\n"
+                    "📸 TNB Bill Document: Take a photo of your TNB bill (the upper portion showing your account number and amount due)\n\n"
+                    "Please ensure the photo is clear and all important details are visible. I'll extract the account information to help you with the payment process."
+                )
+            else:
+                # Generic context-building order: 1) Document context summary 2) EKYC 3) Prior messages 4) Current user message
+                parts = []
+                # 1. Document/context summary (only high-level; avoid dumping huge raw objects)
+                if session_doc:
+                    ctx = session_doc.get('context') or {}
+                    if ctx:
+                        # Summarize each document entry: ref + verification + key fields
+                        if _should_log():
+                            try:
+                                logger.info('Prompt build: summarizing %d context entries', len(ctx))
+                            except Exception:
+                                pass
+                        for key, doc_meta in list(ctx.items())[:5]:  # limit to first 5 to keep prompt small
+                            if not key.startswith('document_'):
+                                continue
+                            ver_status = doc_meta.get('isVerified')
+                            extracted = doc_meta.get('extractedData') or {}
+                            # show only a few stable fields
+                            field_snippets = []
+                            for f in ['full_name', 'userId', 'licenses_number', 'account_number', 'invoice_number']:
+                                if f in extracted:
+                                    val = str(extracted.get(f))
+                                    if len(val) > 40:
+                                        val = val[:37] + '...'
+                                    field_snippets.append(f"{f}:{val}")
+                            snippet = ', '.join(field_snippets) if field_snippets else 'no key fields'
+                            parts.append(f"DOC {key} status={ver_status} {snippet}\n")
+                # 2. EKYC data
+                if session_doc and session_doc.get('ekyc'):
+                    try:
+                        ekyc_str = json.dumps(session_doc.get('ekyc'))
+                    except Exception:
+                        ekyc_str = str(session_doc.get('ekyc'))
+                    parts.append(f"EKYC: {ekyc_str}\n")
                     if _should_log():
                         try:
-                            logger.info('Prompt build: summarizing %d context entries', len(ctx))
+                            logger.info('Prompt build: included EKYC block size=%d chars', len(ekyc_str))
                         except Exception:
                             pass
-                    for key, doc_meta in list(ctx.items())[:5]:  # limit to first 5 to keep prompt small
-                        if not key.startswith('document_'):
-                            continue
-                        ver_status = doc_meta.get('isVerified')
-                        extracted = doc_meta.get('extractedData') or {}
-                        # show only a few stable fields
-                        field_snippets = []
-                        for f in ['full_name', 'userId', 'licenses_number', 'account_number', 'invoice_number']:
-                            if f in extracted:
-                                val = str(extracted.get(f))
-                                if len(val) > 40:
-                                    val = val[:37] + '...'
-                                field_snippets.append(f"{f}:{val}")
-                        snippet = ', '.join(field_snippets) if field_snippets else 'no key fields'
-                        parts.append(f"DOC {key} status={ver_status} {snippet}\n")
-            # 2. EKYC data
-            if session_doc and session_doc.get('ekyc'):
-                try:
-                    ekyc_str = json.dumps(session_doc.get('ekyc'))
-                except Exception:
-                    ekyc_str = str(session_doc.get('ekyc'))
-                parts.append(f"EKYC: {ekyc_str}\n")
+                # 3. Prior messages
+                if session_doc and isinstance(session_doc.get('messages'), list):
+                    if _should_log():
+                        try:
+                            logger.info('Prompt build: iterating %d prior messages', len(session_doc.get('messages')))
+                        except Exception:
+                            pass
+                    for m in session_doc.get('messages'):
+                        role = m.get('role', 'user')
+                        content_parts = []
+                        for c in m.get('content', []):
+                            text = c.get('text') if isinstance(c, dict) else str(c)
+                            if text:
+                                content_parts.append(str(text))
+                        if content_parts:
+                            parts.append(f"{role.upper()}: {' '.join(content_parts)}\n")
+                # 4. Current user message
+                parts.append(f"USER: {message}\n")
+                prompt = "\n".join(parts)
                 if _should_log():
                     try:
-                        logger.info('Prompt build: included EKYC block size=%d chars', len(ekyc_str))
+                        logger.info('Prompt build complete: length=%d chars', len(prompt))
+                        logger.info('Prompt full:\n%s', json.dumps(prompt, indent=2))
                     except Exception:
                         pass
-            # 3. Prior messages
-            if session_doc and isinstance(session_doc.get('messages'), list):
-                if _should_log():
-                    try:
-                        logger.info('Prompt build: iterating %d prior messages', len(session_doc.get('messages')))
-                    except Exception:
-                        pass
-                for m in session_doc.get('messages'):
-                    role = m.get('role', 'user')
-                    content_parts = []
-                    for c in m.get('content', []):
-                        text = c.get('text') if isinstance(c, dict) else str(c)
-                        if text:
-                            content_parts.append(str(text))
-                    if content_parts:
-                        parts.append(f"{role.upper()}: {' '.join(content_parts)}\n")
-            # 4. Current user message
-            parts.append(f"USER: {message}\n")
-            prompt = "\n".join(parts)
-            if _should_log():
-                try:
-                    logger.info('Prompt build complete: length=%d chars', len(prompt))
-                    logger.info('Prompt full:\n%s', json.dumps(prompt, indent=2))
-                except Exception:
-                    pass
 
         model_error = None
         response_text = None
