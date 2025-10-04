@@ -165,6 +165,74 @@ def _log_request(event, body_obj=None):
         logger.exception('Failed to log request')
 
 
+def _service_requirements_met(service_name: str, session_doc: dict) -> bool:
+    """Check if required verified fields exist for a given service.
+
+    renew_license requires: a verified document containing full_name AND userId (IC number).
+    pay_tnb_bill requires: a verified document containing account_number AND invoice_number.
+    Returns True when requirements satisfied, False otherwise.
+    """
+    if not service_name or not session_doc:
+        return False
+    ctx = (session_doc.get('context') or {})
+
+    # Must have at least one document_* entry in context overall
+    document_keys = [k for k in ctx.keys() if k.startswith('document_')]
+    if not document_keys:
+        return False
+
+    # Iterate documents to find a fully verified one with required fields & category constraints
+    required_category_sets = {
+        'renew_license': {'allowed': {'idcard', 'license', 'license-front'}},
+        'pay_tnb_bill': {'allowed': {'tnb'}},
+    }
+
+    for key, doc_meta in ctx.items():
+        if not key.startswith('document_'):
+            continue
+        if doc_meta.get('isVerified') != 'verified':
+            continue
+        extracted = doc_meta.get('extractedData') or {}
+
+        # Category detection path can vary; attempt to read nested detection structure resiliently
+        detected_category = None
+        try:
+            cat_obj = doc_meta.get('categoryDetection') or {}
+            detected_category = cat_obj.get('detected_category')
+        except Exception:
+            detected_category = None
+
+        if service_name == 'renew_license':
+            # Field requirements
+            has_fields = extracted.get('full_name') and extracted.get('userId')
+            # Category requirement: at least one of allowed categories
+            if has_fields:
+                if detected_category in required_category_sets['renew_license']['allowed']:
+                    return True
+                # Allow pass-through if category unknown but fields exist (optional: tighten later)
+        elif service_name == 'pay_tnb_bill':
+            has_fields = extracted.get('account_number') and extracted.get('invoice_number')
+            if has_fields:
+                # Strict: must have tnb category
+                if detected_category in required_category_sets['pay_tnb_bill']['allowed']:
+                    return True
+    return False
+
+
+def _build_service_next_step_message(service_name: str) -> str:
+    """Return placeholder next-step text after identity / document verification for a service."""
+    if service_name == 'renew_license':
+        return (
+            "Identity verified and required license document data captured (full name + IC). "
+            "@TODO: Query MongoDB for existing license record, check expiry, and prompt user for renewal confirmation."
+        )
+    if service_name == 'pay_tnb_bill':
+        return (
+            "Bill details verified (account + invoice number). "
+            "@TODO: Retrieve latest bill amount from MongoDB or billing service and ask user to confirm payment amount."
+        )
+    return "Service data verified. @TODO: implement next workflow steps."
+
 def _detect_service_intent(message_lower: str):
     """Detect high-level service intents from a free-form user message.
 
@@ -1307,6 +1375,37 @@ def lambda_handler(event, context):
             except Exception:
                 pass
 
+    # Refresh session_doc (may have been updated earlier) only if we need service evaluation
+    if (intent_type in (None, 'document_verified')) or (not intent_type and service_intent):
+        try:
+            client_refetch = _connect_mongo()
+            db_refetch = client_refetch['chats']
+            coll_refetch = db_refetch[user_id]
+            session_current_id = new_session_generated if new_session_generated else session_id
+            session_doc = coll_refetch.find_one({'sessionId': session_current_id}) or session_doc
+        except Exception:
+            pass
+        finally:
+            try:
+                client_refetch.close()
+            except Exception:
+                pass
+
+    # Determine active service (persisted) irrespective of current message intent
+    active_service = None
+    if session_doc:
+        active_service = session_doc.get('service') or None
+
+    service_ready = False
+    if active_service:
+        service_ready = _service_requirements_met(active_service, session_doc)
+        if _should_log():
+            try:
+                logger.info('Service readiness check: service=%s ready=%s intent_type=%s', active_service, service_ready, intent_type)
+            except Exception:
+                pass
+
+
     if attachments:
         # Process the first attachment (image document)
         attachment = attachments[0]
@@ -1349,6 +1448,14 @@ def lambda_handler(event, context):
 
     # Determine prompt for Bedrock. For first-time connection, request a welcome message.
     try:
+        # If a service is active and requirements are met, bypass model with deterministic next-step prompt
+        if active_service and service_ready and intent_type not in (
+            'document_processing', 'document_correction_needed', 'document_correction_provided'
+        ):
+            prompt = _build_service_next_step_message(active_service)
+            # Force intent_type to service action stage indicator (optional)
+            if not intent_type or intent_type == 'document_verified':
+                intent_type = f'service_{active_service}_next'
         if _should_log():
             logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
             
@@ -1366,21 +1473,9 @@ def lambda_handler(event, context):
             # Use document analysis prompt for processed documents
             prompt = _generate_document_analysis_prompt(ocr_result, message)
         elif intent_type == 'document_verified':
-            # User has verified the document data, now provide services
-            # Include verified document context for personalized service recommendations
-            verified_doc_context = "{}"
-            if unverified_doc_data:
-                verified_doc_context = json.dumps(unverified_doc_data, indent=2, default=str)
-            
-            prompt = (
-                "SYSTEM: The user has verified that the extracted document information is correct. "
-                "Now provide specific MyGovHub services and next steps based on the verified document data. "
-                "Be helpful and specific about what government services are available. "
-                "\nVerified document context:\n"
-                f"{verified_doc_context}\n\n"
-                f"User message: {message}\n\n"
-                "NOTE: userId represents the Identity Card (IC) number. If you include a signature, use 'MyGovHub Support Team' only."
-            )
+            # Post-verification: intentionally no special prompt; generic context builder will handle.
+            # Keeping an explicit no-op to avoid accidental fall-through confusion.
+            pass
         elif intent_type == 'document_correction_needed':
             # User said the information is wrong, ask for specifics
             extracted_data = unverified_doc_data.get('extractedData', {}) if unverified_doc_data else {}
