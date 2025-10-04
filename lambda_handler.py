@@ -676,9 +676,16 @@ def lambda_handler(event, context):
                 'content': [{'text': str(message)}]
             }
             
-            # Add attachment and intent if present
+            # Add attachment reference instead of full attachment with expiring URL
             if attachments:
-                user_msg_doc['attachment'] = attachments
+                attachment = attachments[0]
+                sanitized_filename = attachment['name'].replace('.', '_')
+                user_msg_doc['attachment'] = {
+                    "reference": f'document_{sanitized_filename}',
+                    "type": attachment.get('type', 'unknown'),
+                    "name": attachment['name']
+                }
+                
             if intent_type:
                 user_msg_doc['intent'] = intent_type
                 
