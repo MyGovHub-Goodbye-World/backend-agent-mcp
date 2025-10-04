@@ -1515,6 +1515,11 @@ def lambda_handler(event, context):
                 ctx = session_doc.get('context') or {}
                 if ctx:
                     # Summarize each document entry: ref + verification + key fields
+                    if _should_log():
+                        try:
+                            logger.info('Prompt build: summarizing %d context entries', len(ctx))
+                        except Exception:
+                            pass
                     for key, doc_meta in list(ctx.items())[:5]:  # limit to first 5 to keep prompt small
                         if not key.startswith('document_'):
                             continue
@@ -1537,8 +1542,18 @@ def lambda_handler(event, context):
                 except Exception:
                     ekyc_str = str(session_doc.get('ekyc'))
                 parts.append(f"EKYC: {ekyc_str}\n")
+                if _should_log():
+                    try:
+                        logger.info('Prompt build: included EKYC block size=%d chars', len(ekyc_str))
+                    except Exception:
+                        pass
             # 3. Prior messages
             if session_doc and isinstance(session_doc.get('messages'), list):
+                if _should_log():
+                    try:
+                        logger.info('Prompt build: iterating %d prior messages', len(session_doc.get('messages')))
+                    except Exception:
+                        pass
                 for m in session_doc.get('messages'):
                     role = m.get('role', 'user')
                     content_parts = []
@@ -1551,10 +1566,31 @@ def lambda_handler(event, context):
             # 4. Current user message
             parts.append(f"USER: {message}\n")
             prompt = "\n".join(parts)
+            if _should_log():
+                try:
+                    logger.info('Prompt build complete: length=%d chars', len(prompt))
+                except Exception:
+                    pass
 
         model_error = None
         response_text = None
         try:
+            # Log full prompt (sanitized & truncated) for debugging if enabled
+            if _should_log():
+                try:
+                    _prompt_log = prompt
+                    # Basic masking for IC-like patterns (e.g., 6-2-4 digits or continuous 12 digits)
+                    import re as _re_mask
+                    _prompt_log = _re_mask.sub(r"******IC******", _re_mask.sub(r"(\d{6}-\d{2}-)\d{4}", r"\1****", _prompt_log))
+                    max_log_len = 3000
+                    truncated = len(_prompt_log) > max_log_len
+                    if truncated:
+                        _prompt_log_out = _prompt_log[:max_log_len] + '...<truncated>'
+                    else:
+                        _prompt_log_out = _prompt_log
+                    logger.info('Prompt full%s length=%d chars:\n%s', ' (truncated)' if truncated else '', len(prompt), _prompt_log_out)
+                except Exception:
+                    pass
             response_text = run_agent(prompt)
         except Exception as model_exc:
             # Record the model failure but continue — we'll persist an assistant error message
