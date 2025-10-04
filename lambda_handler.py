@@ -219,19 +219,104 @@ def _service_requirements_met(service_name: str, session_doc: dict) -> bool:
     return False
 
 
-def _build_service_next_step_message(service_name: str) -> str:
-    """Return placeholder next-step text after identity / document verification for a service."""
+def _build_service_next_step_message(service_name: str, user_id: str, session_id: str, session_doc: dict) -> str:
+    """Return next-step text after identity/document verification for a service.
+
+    Enhancements:
+      - For renew_license: fetch license record from MongoDB `licenses` collection using userId.
+        Store (without _id) under context.database_license if retrieved.
+        License status handling:
+          * suspended -> instruct physical branch visit (cannot renew here)
+          * active or expired -> ask user to confirm proceeding with renewal (extending validity)
+      - For pay_tnb_bill: keep placeholder (future: fetch bill details).
+    """
+    service_name = service_name or ''
+
     if service_name == 'renew_license':
+        db_name = os.getenv('ATLAS_DB_NAME') or ''
+        if not db_name:
+            return ("License verification complete, but database name not configured. Please set ATLAS_DB_NAME environment variable.")
+        license_record = None
+        record_for_context = None
+        try:
+            client = _connect_mongo()
+            try:
+                # Fetch license
+                lic_coll = client[db_name]['licenses']
+                license_record = lic_coll.find_one({'userId': user_id})
+                if _should_log():
+                    logger.info('License lookup userId=%s found=%s', user_id, bool(license_record))
+                if not license_record:
+                    return (
+                        "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+                        "USER-FACING MESSAGE:\n"
+                        "Identity verified, but I didn't find an existing driving license record for your IC. "
+                        "Please visit the nearest JPJ Malaysia branch to apply for a new license."
+                    )
+                
+                # Prepare record (strip _id)
+                record_for_context = {k: v for k, v in license_record.items() if k != '_id'}
+
+                # Update session context
+                try:
+                    chats_db = client['chats']
+                    user_coll = chats_db[user_id]
+                    user_coll.update_one({'sessionId': session_id}, {'$set': {'context.database_license': record_for_context}})
+                    if _should_log():
+                        logger.info('Stored license record in session context sessionId=%s', session_id)
+                except Exception:
+                    if _should_log():
+                        logger.exception('Failed to persist license record into session context')
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            if _should_log():
+                logger.exception('License retrieval/update failure: %s', str(e))
+            return (
+                "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+                "USER-FACING MESSAGE:\n"
+                "Identity verified, but I couldn't retrieve your license record right now. Please try again shortly or provide more details."
+            )
+
+        # Use record_for_context for message composition
+        status = (record_for_context or {}).get('status')
+        valid_from = (record_for_context or {}).get('valid_from')
+        valid_to = (record_for_context or {}).get('valid_to')
+        license_number = (record_for_context or {}).get('license_number')
+
+        if status == 'suspended':
+            return (
+                "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+                "USER-FACING MESSAGE:\n"
+                "We located your driving license record (License No: {ln}). Current status: SUSPENDED. "
+                "Suspended licenses must be handled at a physical branch for investigation or reinstatement. "
+                "Please visit the nearest JPJ Malaysia branch to resolve the suspension before renewal.".format(ln=license_number or 'N/A')
+            )
+
         return (
-            "Identity verified and required license document data captured (full name + IC). "
-            "@TODO: Query MongoDB for existing license record, check expiry, and prompt user for renewal confirmation."
+            "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+            "USER-FACING MESSAGE:\n"
+            f"We found your driving license record (License No: {license_number or 'N/A'})."
+            f"Valid from: {valid_from or 'N/A'}, Valid to: {valid_to or 'N/A'}. "
+            f"Status: {status.upper()}."
+            "I can help extend your license validity. Are you sure you want to proceed with renewal?"
         )
+
     if service_name == 'pay_tnb_bill':
         return (
+            "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+            "USER-FACING MESSAGE:\n"
             "Bill details verified (account + invoice number). "
             "@TODO: Retrieve latest bill amount from MongoDB or billing service and ask user to confirm payment amount."
         )
-    return "Service data verified. @TODO: implement next workflow steps."
+    return (
+        "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+        "USER-FACING MESSAGE:\n"
+        "Service data verified. @TODO: implement next workflow steps."
+    )
 
 def _detect_service_intent(message_lower: str):
     """Detect high-level service intents from a free-form user message.
@@ -1352,6 +1437,7 @@ def lambda_handler(event, context):
     # Service intent detection (only if no document-processing intent determined)
     # --------------------------------------------------------------
     service_intent = None
+    AVAILABLE_SERVICE_INTENTS = ['renew_license', 'pay_tnb_bill']
     if not intent_type and attachments == []:  # pure text request
         service_intent = _detect_service_intent(message_lower)
         if service_intent == 'renew_license':
@@ -1360,7 +1446,7 @@ def lambda_handler(event, context):
             intent_type = 'pay_tnb_bill'
 
     # If we have a service intent, update session 'service' field (v1: no legacy topic handling)
-    if service_intent in ('renew_license', 'pay_tnb_bill'):
+    if service_intent in AVAILABLE_SERVICE_INTENTS:
         try:
             client_service = _connect_mongo()
             db_service = client_service['chats']
@@ -1446,20 +1532,24 @@ def lambda_handler(event, context):
                     logger.info('Document processed successfully. Category: %s, Intent type: %s', 
                                 ocr_result.get('category_detection', {}).get('detected_category', 'unknown'), intent_type)
 
-    # Determine prompt for Bedrock. For first-time connection, request a welcome message.
+    # Determine prompt for Bedrock.
     try:
         # If a service is active and requirements are met, bypass model with deterministic next-step prompt
         if active_service and service_ready and intent_type not in (
             'document_processing', 'document_correction_needed', 'document_correction_provided'
         ):
-            prompt = _build_service_next_step_message(active_service)
+            prompt = _build_service_next_step_message(active_service, user_id, session_id, session_doc)
             # Force intent_type to service action stage indicator (optional)
             if not intent_type or intent_type == 'document_verified':
                 intent_type = f'service_{active_service}_next'
+            if _should_log():
+                logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
+        else:
         if _should_log():
             logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
-            
+
         if session_id == '(new-session)':
+            # For first-time connection, request a welcome message.
             prompt = (
                 "SYSTEM: You are a friendly assistant that composes a short welcome message "
                 "for a government services portal called MyGovHub. The message MUST mention "
@@ -1664,6 +1754,7 @@ def lambda_handler(event, context):
             if _should_log():
                 try:
                     logger.info('Prompt build complete: length=%d chars', len(prompt))
+                    logger.info('Prompt full:\n%s', json.dumps(prompt, indent=2))
                 except Exception:
                     pass
 
