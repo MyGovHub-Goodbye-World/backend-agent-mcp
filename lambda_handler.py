@@ -234,7 +234,7 @@ def _process_document_attachment(attachment):
         return None
 
 
-def _save_document_context_to_session(user_id, session_id, ocr_result, attachment_name):
+def _save_document_context_to_session(user_id, session_id, ocr_result, attachment_name, processed_at_iso):
     """Save extracted document data to the session context in MongoDB.
     
     Args:
@@ -242,6 +242,7 @@ def _save_document_context_to_session(user_id, session_id, ocr_result, attachmen
         session_id: Session ID
         ocr_result: OCR analysis result
         attachment_name: Original attachment filename
+        processed_at_iso: ISO timestamp for when the document was processed
     """
     try:
         client = _connect_mongo()
@@ -260,7 +261,7 @@ def _save_document_context_to_session(user_id, session_id, ocr_result, attachmen
             f'context.document_{sanitized_filename}': {
                 'extractedData': extracted_data,
                 'categoryDetection': category_detection,
-                'processedAt': datetime.now(timezone.utc).isoformat(),
+                'processedAt': processed_at_iso,
                 'filename': attachment_name  # Keep original filename for reference
             }
         }
@@ -592,7 +593,7 @@ def lambda_handler(event, context):
                 # Document is clear, set intent type and save context to session
                 intent_type = 'document_processing'
                 session_to_save = new_session_generated if new_session_generated else session_id
-                _save_document_context_to_session(user_id, session_to_save, ocr_result, attachment['name'])
+                _save_document_context_to_session(user_id, session_to_save, ocr_result, attachment['name'], created_at_iso)
                 
                 if _should_log():
                     logger.info('Document processed successfully. Category: %s, Intent type: %s', 
@@ -681,13 +682,12 @@ def lambda_handler(event, context):
 
             # push the assistant message; if model failed, store an error message as assistant reply
             assistant_message_id = str(uuid.uuid4())
-            assistant_timestamp = datetime.now(timezone.utc).isoformat()
             
             if response_text is not None:
                 assistant_msg_doc = {
                     'messageId': assistant_message_id,
                     'message': str(response_text),
-                    'timestamp': assistant_timestamp,
+                    'timestamp': created_at_iso,
                     'type': 'assistant',
                     'role': 'assistant',
                     'content': [{'text': str(response_text)}]
@@ -696,7 +696,7 @@ def lambda_handler(event, context):
                 assistant_msg_doc = {
                     'messageId': assistant_message_id,
                     'message': 'ERROR: assistant failed to respond. See modelError in response.',
-                    'timestamp': assistant_timestamp,
+                    'timestamp': created_at_iso,
                     'type': 'assistant',
                     'role': 'assistant',
                     'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}],
