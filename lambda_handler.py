@@ -252,13 +252,16 @@ def _save_document_context_to_session(user_id, session_id, ocr_result, attachmen
         extracted_data = ocr_result.get('extracted_data', {})
         category_detection = ocr_result.get('category_detection', {})
         
+        # Sanitize filename to avoid MongoDB nested object issues (replace dots with underscores)
+        sanitized_filename = attachment_name.replace('.', '_')
+        
         # Update the session document's context with extracted data
         context_update = {
-            f'context.document_{attachment_name}': {
+            f'context.document_{sanitized_filename}': {
                 'extractedData': extracted_data,
                 'categoryDetection': category_detection,
                 'processedAt': datetime.now(timezone.utc).isoformat(),
-                'filename': attachment_name
+                'filename': attachment_name  # Keep original filename for reference
             }
         }
         
