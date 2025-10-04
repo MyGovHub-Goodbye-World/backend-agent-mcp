@@ -1557,7 +1557,6 @@ def lambda_handler(event, context):
                 'messageId': message_id,
                 'message': str(message),
                 'timestamp': user_timestamp_iso,
-                'type': 'user',
                 'role': 'user',
                 'content': [{'text': str(message)}]
             }
@@ -1589,7 +1588,6 @@ def lambda_handler(event, context):
                     'messageId': assistant_message_id,
                     'message': str(response_text),
                     'timestamp': assistant_timestamp_iso,
-                    'type': 'assistant',
                     'role': 'assistant',
                     'content': [{'text': str(response_text)}]
                 }
@@ -1598,7 +1596,6 @@ def lambda_handler(event, context):
                     'messageId': assistant_message_id,
                     'message': 'ERROR: assistant failed to respond. See modelError in response.',
                     'timestamp': assistant_timestamp_iso,
-                    'type': 'assistant',
                     'role': 'assistant',
                     'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}],
                     'meta': {'modelError': model_error}
