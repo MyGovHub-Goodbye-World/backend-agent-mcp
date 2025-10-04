@@ -234,7 +234,7 @@ def _process_document_attachment(attachment):
         return None
 
 
-def _save_document_context_to_session(user_id, session_id, ocr_result, attachment_name, processed_at_iso):
+def _save_document_context_to_session(user_id, session_id, ocr_result, attachment_name):
     """Save extracted document data to the session context in MongoDB.
     
     Args:
@@ -242,7 +242,6 @@ def _save_document_context_to_session(user_id, session_id, ocr_result, attachmen
         session_id: Session ID
         ocr_result: OCR analysis result
         attachment_name: Original attachment filename
-        processed_at_iso: ISO timestamp for when the document was processed
     """
     try:
         client = _connect_mongo()
@@ -261,9 +260,9 @@ def _save_document_context_to_session(user_id, session_id, ocr_result, attachmen
             f'context.document_{sanitized_filename}': {
                 'extractedData': extracted_data,
                 'categoryDetection': category_detection,
-                'processedAt': processed_at_iso,
-                'filename': attachment_name,  # Keep original filename for reference
-                'isVerified': False  # Requires user verification before proceeding
+                'filename': attachment_name,
+                # Tri-state string: 'unverified' | 'correcting' | 'verified'
+                'isVerified': 'unverified'
             }
         }
         
@@ -341,13 +340,26 @@ def _generate_document_analysis_prompt(ocr_result, user_message):
             f"SYSTEM: You are processing a document for a government services portal (MyGovHub).",
             f"Document category detected: {detected_category} (confidence: {confidence:.2f})",
             f"Intent type: document_processing",
+            f"NOTE: The 'userId' field represents the Identity Card (IC) number.",
             ""
         ]
         
         if extracted_data:
-            prompt_parts.append("Extracted structured data:")
+            prompt_parts.append("Extracted structured data (show with user-friendly labels):")
+            # Field mapping for user-friendly display
+            field_mapping = {
+                'full_name': 'Full Name',
+                'userId': 'IC Number',
+                'gender': 'Gender', 
+                'address': 'Address',
+                'licenses_number': 'License Number',
+                'account_number': 'Account Number',
+                'invoice_number': 'Invoice Number'
+            }
+            
             for key, value in extracted_data.items():
-                prompt_parts.append(f"- {key}: {value}")
+                friendly_name = field_mapping.get(key, key.replace('_', ' ').title())
+                prompt_parts.append(f"- {friendly_name}: {value}")
             prompt_parts.append("")
         
         if extracted_text:
@@ -387,6 +399,514 @@ def _generate_document_analysis_prompt(ocr_result, user_message):
             logger.error('Failed to generate document analysis prompt: %s', str(e))
         # Fallback prompt
         return f"SYSTEM: Document processing completed. User message: {user_message}. Please provide assistance based on the uploaded document."
+
+
+def _parse_document_corrections(message: str, current_data: dict) -> dict:
+    """Parse user free-form correction text into field->value mapping.
+
+    Supports patterns like:
+      - "wrong, full name is lim wen hau"
+      - "full_name: LIM WEN HAU"
+      - "name should be LIM WEN HAU"
+      - "IC is 041223-07-0745"
+      - Multiple lines each containing a correction.
+
+    The parser is tolerant of punctuation and case. It attempts fuzzy matching
+    against existing keys in current_data and known synonyms. Returns only
+    fields that can be confidently matched.
+    """
+    import re
+    if not message or not current_data:
+        return {}
+
+    original_message = message
+    # Normalize spacing
+    message = re.sub(r"\s+", " ", message.strip())
+
+    # Lower copy for pattern detection while we keep original for value extraction
+    lower_msg = message.lower()
+
+    # Split into candidate segments (newline, ' and ', commas used as delimiters)
+    # Keep semicolons and periods as potential delimiters when followed by space
+    segments = re.split(r"[\n;,]+|\band\b", message, flags=re.IGNORECASE)
+
+    # Known synonym lists
+    synonyms = {
+        'full_name': ['full name', 'name', 'nama'],
+        'userId': ['ic', 'ic number', 'id number', 'id', 'userid', 'identity card'],
+        'gender': ['gender', 'sex', 'jantina'],
+        'address': ['address', 'alamat', 'location'],
+        'licenses_number': ['license', 'license number', 'lesen'],
+        'account_number': ['account', 'account number'],
+        'invoice_number': ['invoice', 'invoice number']
+    }
+
+    # Reverse map for quick lookup
+    synonym_to_field = {}
+    for field, words in synonyms.items():
+        for w in words:
+            synonym_to_field[w] = field
+
+    # Helper to resolve a raw field token to actual existing field
+    def resolve_field(token: str):
+        t = token.lower().strip(': ').strip()
+        # Exact existing key
+        for k in current_data.keys():
+            if t == k.lower():
+                return k
+        # Direct synonym
+        if t in synonym_to_field:
+            mapped = synonym_to_field[t]
+            # prefer existing key if present
+            for k in current_data.keys():
+                if k.lower() == mapped.lower():
+                    return k
+            return mapped
+        # Partial match within existing keys
+        for k in current_data.keys():
+            if t in k.lower() or k.lower() in t:
+                return k
+        return None
+
+    corrections = {}
+
+    # Pattern variants to attempt per segment
+    pattern_specs = [
+        # field: value
+        re.compile(r"^(?P<field>[A-Za-z_ ]{2,30})\s*[:=-]\s*(?P<value>.+)$"),
+        # field should be value
+        re.compile(r"^(?P<field>[A-Za-z_ ]{2,30})\s+should\s+be\s+(?P<value>.+)$", re.IGNORECASE),
+        # field is value
+        re.compile(r"^(?P<field>[A-Za-z_ ]{2,30})\s+is\s+(?P<value>.+)$", re.IGNORECASE),
+        # wrong, field is value OR wrong field is value
+        re.compile(r"^(?:wrong[, ]+)?(?P<field>[A-Za-z_ ]{2,30})\s+is\s+(?P<value>.+)$", re.IGNORECASE),
+        # fix field to value / change field to value / update field to value
+        re.compile(r"^(?:fix|change|update)\s+(?P<field>[A-Za-z_ ]{2,30})\s+(?:to|as)\s+(?P<value>.+)$", re.IGNORECASE),
+    ]
+
+    for raw_segment in segments:
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        # Remove leading qualifiers
+        segment = re.sub(r"^(wrong|no|not|incorrect)[, ]+", "", segment, flags=re.IGNORECASE)
+        matched = False
+        for pat in pattern_specs:
+            m = pat.match(segment)
+            if m:
+                field_token = m.group('field').strip()
+                value = m.group('value').strip()
+                resolved = resolve_field(field_token)
+                if resolved and value:
+                    corrections[resolved] = value
+                matched = True
+                break
+        if matched:
+            continue
+        # Heuristic: "full name is abc" inside longer sentence
+        for field_key in current_data.keys():
+            # Search pattern like '<synonym> is <value>'
+            for syn in [field_key] + synonyms.get(field_key, []):
+                syn_lower = syn.lower()
+                idx = segment.lower().find(f"{syn_lower} is ")
+                if idx != -1:
+                    val = segment[idx + len(syn_lower) + 4:].strip()
+                    if val:
+                        corrections[field_key] = val
+                        break
+
+    # Normalize whitespace of values
+    for k, v in list(corrections.items()):
+        corrections[k] = re.sub(r"\s+", " ", v).strip()
+
+    return corrections
+
+
+# Initialize logger for CloudWatch
+logger = logging.getLogger('lambda_handler')
+logger.setLevel(logging.INFO)
+
+
+def _should_log():
+    try:
+        return os.getenv('SHOW_CLOUDWATCH_LOGS', 'false').lower() in ('1', 'true', 'yes')
+    except Exception:
+        return False
+
+def _log_request(event, body_obj=None):
+    try:
+        request_context = event.get('requestContext', {})
+        http = request_context.get('http') or {}
+        path = http.get('path') if isinstance(http, dict) else event.get('rawPath') or event.get('path')
+        method = http.get('method') if isinstance(http, dict) else event.get('httpMethod')
+        log_obj = {
+            'path': path,
+            'method': method,
+        }
+        if body_obj is not None:
+            log_obj['body'] = body_obj
+        else:
+            log_obj['body'] = event.get('body')
+        if _should_log():
+            logger.info('Request received: %s', json.dumps(log_obj))
+    except Exception:
+        logger.exception('Failed to log request')
+
+def _connect_mongo():
+    """Create a MongoDB client using ATLAS_URI from env.
+
+    Raises RuntimeError if ATLAS_URI is missing or the connection cannot be established.
+    Returns a pymongo.MongoClient on success.
+    """
+    atlas_uri = os.getenv('ATLAS_URI') + '?retryWrites=true&w=majority'
+    if not atlas_uri:
+        raise RuntimeError('ATLAS_URI environment variable is not set')
+    try:
+        client = pymongo.MongoClient(atlas_uri, serverSelectionTimeoutMS=5000)
+        # attempt server selection
+        client.admin.command('ping')
+        return client
+    except Exception as e:
+        raise RuntimeError(f'Failed to connect to MongoDB: {e}')
+
+
+def _process_document_attachment(attachment):
+    """Process document attachment by calling OCR_ANALYZE_API_URL.
+    
+    Args:
+        attachment: dict with 'url' and 'name' fields
+        
+    Returns:
+        dict: OCR analysis result or None if processing fails
+    """
+    try:
+        ocr_api_url = os.getenv('OCR_ANALYZE_API_URL')
+        if not ocr_api_url:
+            raise RuntimeError('OCR_ANALYZE_API_URL environment variable is not set')
+        
+        # Fetch image from URL
+        response = requests.get(attachment['url'], timeout=30)
+        response.raise_for_status()
+        
+        # Convert to base64
+        file_content = base64.b64encode(response.content).decode('utf-8')
+        
+        # Prepare payload for OCR API
+        payload = {
+            'file_content': file_content,
+            'filename': attachment['name']
+        }
+        
+        # Call OCR API
+        ocr_response = requests.post(
+            ocr_api_url,
+            json=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=60
+        )
+        ocr_response.raise_for_status()
+        
+        ocr_result = ocr_response.json()
+        
+        # Log OCR API response to CloudWatch
+        if _should_log():
+            logger.info('OCR API response for file %s: %s', 
+                       attachment['name'], 
+                       json.dumps(ocr_result, indent=2, default=str))
+        
+        return ocr_result
+        
+    except Exception as e:
+        if _should_log():
+            logger.error('Failed to process document attachment: %s', str(e))
+        return None
+
+
+def _save_document_context_to_session(user_id, session_id, ocr_result, attachment_name):
+    """Save extracted document data to the session context in MongoDB.
+    
+    Args:
+        user_id: User ID
+        session_id: Session ID
+        ocr_result: OCR analysis result
+        attachment_name: Original attachment filename
+    """
+    try:
+        client = _connect_mongo()
+        db = client['chats']
+        coll = db[user_id]
+        
+        # Prepare context data with extracted information
+        extracted_data = ocr_result.get('extracted_data', {})
+        category_detection = ocr_result.get('category_detection', {})
+        
+        # Sanitize filename to avoid MongoDB nested object issues (replace dots with underscores)
+        sanitized_filename = attachment_name.replace('.', '_')
+        
+        # Update the session document's context with extracted data
+        context_update = {
+            f'context.document_{sanitized_filename}': {
+                'extractedData': extracted_data,
+                'categoryDetection': category_detection,
+                'filename': attachment_name,  # Keep original filename for reference
+                'isVerified': 'unverified'  # Requires user verification before proceeding
+            }
+        }
+        
+        coll.update_one(
+            {'sessionId': session_id}, 
+            {'$set': context_update}
+        )
+        
+        if _should_log():
+            logger.info('Saved document context to session: user=%s session=%s filename=%s', 
+                       user_id, session_id, attachment_name)
+        
+    except Exception as e:
+        if _should_log():
+            logger.error('Failed to save document context to session: %s', str(e))
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _check_document_quality(ocr_result):
+    """Check if document is blurry based on OCR analysis results.
+    
+    Args:
+        ocr_result: OCR analysis result dict
+        
+    Returns:
+        tuple: (is_blurry: bool, blur_message: str or None)
+    """
+    try:
+        blur_analysis = ocr_result.get('blur_analysis', {})
+        overall_assessment = blur_analysis.get('overall_assessment', {})
+        is_blurry = overall_assessment.get('is_blurry', False)
+        
+        if is_blurry:
+            return True, "The document image appears to be blurry or unclear. Please take a clearer photo and send the document again for better processing."
+        
+        return False, None
+        
+    except Exception as e:
+        if _should_log():
+            logger.error('Failed to check document quality: %s', str(e))
+        return False, None
+
+
+def _generate_document_analysis_prompt(ocr_result, user_message):
+    """Generate appropriate prompt for document processing based on category detection.
+    
+    Args:
+        ocr_result: OCR analysis result dict
+        user_message: Original user message
+        
+    Returns:
+        str: Generated prompt for the AI model
+    """
+    try:
+        category_detection = ocr_result.get('category_detection', {})
+        detected_category = category_detection.get('detected_category', 'unknown')
+        confidence = category_detection.get('confidence', 0)
+        
+        extracted_data = ocr_result.get('extracted_data', {})
+        text_content = ocr_result.get('text', [])
+        
+        # Extract meaningful text from OCR results
+        text_parts = []
+        for text_item in text_content:
+            if isinstance(text_item, dict) and text_item.get('text'):
+                text_parts.append(text_item['text'])
+        
+        extracted_text = ' '.join(text_parts) if text_parts else ''
+        
+        prompt_parts = [
+            f"SYSTEM: You are processing a document for a government services portal (MyGovHub).",
+            f"Document category detected: {detected_category} (confidence: {confidence:.2f})",
+            f"Intent type: document_processing",
+            f"NOTE: The 'userId' field represents the Identity Card (IC) number.",
+            ""
+        ]
+        
+        if extracted_data:
+            prompt_parts.append("Extracted structured data (show with user-friendly labels):")
+            # Field mapping for user-friendly display
+            field_mapping = {
+                'full_name': 'Full Name',
+                'userId': 'IC Number',
+                'gender': 'Gender', 
+                'address': 'Address',
+                'licenses_number': 'License Number',
+                'account_number': 'Account Number',
+                'invoice_number': 'Invoice Number'
+            }
+            
+            for key, value in extracted_data.items():
+                friendly_name = field_mapping.get(key, key.replace('_', ' ').title())
+                prompt_parts.append(f"- {friendly_name}: {value}")
+            prompt_parts.append("")
+        
+        if extracted_text:
+            prompt_parts.append(f"Document text content: {extracted_text[:1000]}...")  # Limit length
+            prompt_parts.append("")
+        
+        # Category-specific guidance
+        category_guidance = {
+            'receipt': "This appears to be a receipt. Help the user understand the transaction details and offer relevant government services like expense reporting or tax documentation.",
+            'invoice': "This appears to be an invoice. Assist with business registration, tax filing, or payment verification services.",
+            'license': "This appears to be a license document. Help with renewal processes, verification, or related permit applications.",
+            'permit': "This appears to be a permit document. Assist with permit renewals, status checks, or related applications.",
+            'identification': "This appears to be an identification document. Help with identity verification, document renewal, or related services.",
+            'bill': "This appears to be a utility or service bill. Assist with bill payment services or account verification.",
+            'form': "This appears to be a government form. Help with form completion, submission, or status tracking.",
+        }
+        
+        guidance = category_guidance.get(detected_category, "Analyze the document and provide relevant assistance based on the content.")
+        prompt_parts.append(f"Guidance: {guidance}")
+        prompt_parts.append("")
+        
+        if user_message.strip():
+            prompt_parts.append(f"User message: {user_message}")
+        else:
+            prompt_parts.append("User uploaded a document without additional message.")
+        prompt_parts.append("")
+        prompt_parts.append("IMPORTANT: Keep your response concise. Show ONLY the extracted key information in a simple format.")
+        prompt_parts.append("After showing the data, ask: 'Is this information correct? Please reply YES to confirm.'")
+        prompt_parts.append("Do not repeat the information multiple times or add lengthy explanations.")
+        prompt_parts.append("")
+        prompt_parts.append("NOTE: If you include a signature, use 'MyGovHub Support Team' only. Do not use placeholders like '[Your Name]' or similar.")
+        
+        return '\n'.join(prompt_parts)
+        
+    except Exception as e:
+        if _should_log():
+            logger.error('Failed to generate document analysis prompt: %s', str(e))
+        # Fallback prompt
+        return f"SYSTEM: Document processing completed. User message: {user_message}. Please provide assistance based on the uploaded document."
+
+
+def _parse_document_corrections(message: str, current_data: dict) -> dict:
+    """Parse user free-form correction text into field->value mapping.
+
+    Supports patterns like:
+      - "wrong, full name is lim wen hau"
+      - "full_name: LIM WEN HAU"
+      - "name should be LIM WEN HAU"
+      - "IC is 041223-07-0745"
+      - Multiple lines each containing a correction.
+
+    The parser is tolerant of punctuation and case. It attempts fuzzy matching
+    against existing keys in current_data and known synonyms. Returns only
+    fields that can be confidently matched.
+    """
+    import re
+    if not message or not current_data:
+        return {}
+
+    original_message = message
+    # Normalize spacing
+    message = re.sub(r"\s+", " ", message.strip())
+
+    # Lower copy for pattern detection while we keep original for value extraction
+    lower_msg = message.lower()
+
+    # Split into candidate segments (newline, ' and ', commas used as delimiters)
+    # Keep semicolons and periods as potential delimiters when followed by space
+    segments = re.split(r"[\n;,]+|\band\b", message, flags=re.IGNORECASE)
+
+    # Known synonym lists
+    synonyms = {
+        'full_name': ['full name', 'name', 'nama'],
+        'userId': ['ic', 'ic number', 'id number', 'id', 'userid', 'identity card'],
+        'gender': ['gender', 'sex', 'jantina'],
+        'address': ['address', 'alamat', 'location'],
+        'licenses_number': ['license', 'license number', 'lesen'],
+        'account_number': ['account', 'account number'],
+        'invoice_number': ['invoice', 'invoice number']
+    }
+
+    # Reverse map for quick lookup
+    synonym_to_field = {}
+    for field, words in synonyms.items():
+        for w in words:
+            synonym_to_field[w] = field
+
+    # Helper to resolve a raw field token to actual existing field
+    def resolve_field(token: str):
+        t = token.lower().strip(': ').strip()
+        # Exact existing key
+        for k in current_data.keys():
+            if t == k.lower():
+                return k
+        # Direct synonym
+        if t in synonym_to_field:
+            mapped = synonym_to_field[t]
+            # prefer existing key if present
+            for k in current_data.keys():
+                if k.lower() == mapped.lower():
+                    return k
+            return mapped
+        # Partial match within existing keys
+        for k in current_data.keys():
+            if t in k.lower() or k.lower() in t:
+                return k
+        return None
+
+    corrections = {}
+
+    # Pattern variants to attempt per segment
+    pattern_specs = [
+        # field: value
+        re.compile(r"^(?P<field>[A-Za-z_ ]{2,30})\s*[:=-]\s*(?P<value>.+)$"),
+        # field should be value
+        re.compile(r"^(?P<field>[A-Za-z_ ]{2,30})\s+should\s+be\s+(?P<value>.+)$", re.IGNORECASE),
+        # field is value
+        re.compile(r"^(?P<field>[A-Za-z_ ]{2,30})\s+is\s+(?P<value>.+)$", re.IGNORECASE),
+        # wrong, field is value OR wrong field is value
+        re.compile(r"^(?:wrong[, ]+)?(?P<field>[A-Za-z_ ]{2,30})\s+is\s+(?P<value>.+)$", re.IGNORECASE),
+        # fix field to value / change field to value / update field to value
+        re.compile(r"^(?:fix|change|update)\s+(?P<field>[A-Za-z_ ]{2,30})\s+(?:to|as)\s+(?P<value>.+)$", re.IGNORECASE),
+    ]
+
+    for raw_segment in segments:
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        # Remove leading qualifiers
+        segment = re.sub(r"^(wrong|no|not|incorrect)[, ]+", "", segment, flags=re.IGNORECASE)
+        matched = False
+        for pat in pattern_specs:
+            m = pat.match(segment)
+            if m:
+                field_token = m.group('field').strip()
+                value = m.group('value').strip()
+                resolved = resolve_field(field_token)
+                if resolved and value:
+                    corrections[resolved] = value
+                matched = True
+                break
+        if matched:
+            continue
+        # Heuristic: "full name is abc" inside longer sentence
+        for field_key in current_data.keys():
+            # Search pattern like '<synonym> is <value>'
+            for syn in [field_key] + synonyms.get(field_key, []):
+                syn_lower = syn.lower()
+                idx = segment.lower().find(f"{syn_lower} is ")
+                if idx != -1:
+                    val = segment[idx + len(syn_lower) + 4:].strip()
+                    if val:
+                        corrections[field_key] = val
+                        break
+
+    # Normalize whitespace of values
+    for k, v in list(corrections.items()):
+        corrections[k] = re.sub(r"\s+", " ", v).strip()
+
+    return corrections
 
 
 def lambda_handler(event, context):
@@ -566,42 +1086,177 @@ def lambda_handler(event, context):
     ocr_result = None
     intent_type = None
     
-    # Check if this is a document verification request (user confirming extracted data)
-    if message.lower().strip() in ['yes', 'correct', 'verified', 'confirm', 'looks good', 'accurate']:
-        # Look for unverified documents in the session context
-        if session_doc and session_doc.get('context'):
-            for key, doc_data in session_doc['context'].items():
-                if key.startswith('document_') and not doc_data.get('isVerified', True):
-                    intent_type = 'document_verified'
-                    # Mark the document as verified
-                    try:
-                        client_verify = _connect_mongo()
-                        db_verify = client_verify['chats']
-                        coll_verify = db_verify[user_id]
-                        
-                        verification_update = {
-                            f'context.{key}.isVerified': True,
-                            f'context.{key}.verifiedAt': created_at_iso
-                        }
-                        
-                        session_to_verify = new_session_generated if new_session_generated else session_id
-                        coll_verify.update_one(
-                            {'sessionId': session_to_verify}, 
-                            {'$set': verification_update}
-                        )
-                        
-                        if _should_log():
-                            logger.info('Document verified by user: %s', key)
-                            
-                    except Exception as e:
-                        if _should_log():
-                            logger.error('Failed to update document verification: %s', str(e))
-                    finally:
-                        try:
-                            client_verify.close()
-                        except Exception:
-                            pass
-                    break
+    # Check document verification status and handle user responses
+    verification_status = None
+    unverified_doc_key = None
+    unverified_doc_data = None
+    
+    # Find documents needing verification (isVerified tri-state string). Migrate legacy boolean if encountered.
+    if session_doc and session_doc.get('context'):
+        migrate_updates = {}
+        for key, doc_data in session_doc['context'].items():
+            if not key.startswith('document_'):
+                continue
+            val = doc_data.get('isVerified')
+            if isinstance(val, bool):  # legacy boolean -> map
+                new_val = 'verified' if val else 'unverified'
+                doc_data['isVerified'] = new_val
+                migrate_updates[f'context.{key}.isVerified'] = new_val
+                val = new_val
+            if val in ('unverified', 'correcting') and unverified_doc_key is None:
+                unverified_doc_key = key
+                unverified_doc_data = doc_data
+        if migrate_updates:
+            try:
+                client_mig = _connect_mongo()
+                db_mig = client_mig['chats']
+                coll_mig = db_mig[user_id]
+                session_to_mig = new_session_generated if new_session_generated else session_id
+                coll_mig.update_one({'sessionId': session_to_mig}, {'$set': migrate_updates})
+                if _should_log():
+                    logger.info('Migrated legacy boolean isVerified to tri-state: %s', migrate_updates)
+            except Exception as e:
+                if _should_log():
+                    logger.error('Migration failure: %s', str(e))
+            finally:
+                try:
+                    client_mig.close()
+                except Exception:
+                    pass
+    
+    # Handle verification responses
+    message_lower = message.lower().strip()
+    
+    def _has_field_pattern(msg: str) -> bool:
+        field_synonyms = ['name', 'full name', 'ic', 'ic number', 'gender', 'address', 'license', 'account', 'invoice']
+        return any(f" {syn} " in msg or msg.startswith(f"{syn} ") for syn in field_synonyms)
+
+    def _is_affirmative(msg: str) -> bool:
+        # Accept short pure confirmations only; reject if appears to contain field corrections
+        aff_tokens = {'yes', 'ya', 'y', 'ok', 'okay', 'correct', 'accurate', 'looks good', 'betul', 'ya betul'}
+        cleaned = msg.strip().lower()
+        if len(cleaned) <= 15 and cleaned in aff_tokens:
+            return True
+        # Multi-word accept if all tokens in affirmative set
+        if all(t in aff_tokens for t in cleaned.replace('!', '').split()):
+            return True
+        return False
+
+    # Order: explicit rejection -> corrections -> affirmation
+    # Rejection (needs corrections)
+    if unverified_doc_key and message_lower in ['no', 'incorrect', 'wrong', 'not correct', 'not accurate']:
+        intent_type = 'document_correction_needed'
+        verification_status = 'rejected'
+        # Set status to correcting
+        try:
+            client_status = _connect_mongo()
+            db_status = client_status['chats']
+            coll_status = db_status[user_id]
+            session_to_status = new_session_generated if new_session_generated else session_id
+            coll_status.update_one({'sessionId': session_to_status}, {'$set': {f'context.{unverified_doc_key}.isVerified': 'correcting'}})
+        except Exception:
+            pass
+        finally:
+            try:
+                client_status.close()
+            except Exception:
+                pass
+    # Corrections detection
+    elif unverified_doc_key:
+        current_data = unverified_doc_data.get('extractedData', {}) if unverified_doc_data else {}
+        parsed_corrections_probe = _parse_document_corrections(message, current_data) if current_data else {}
+        if parsed_corrections_probe:
+            intent_type = 'document_correction_provided'
+            verification_status = 'correcting'
+            if _should_log():
+                logger.info('Parsed corrections found pre-classification: %s', parsed_corrections_probe)
+        # Affirmation only if no corrections parsed and message is simple confirm
+        elif _is_affirmative(message_lower) and not _has_field_pattern(f' {message_lower} '):
+            intent_type = 'document_verified'
+            verification_status = 'confirmed'
+    # Legacy path (affirmation first) kept for cases without document
+    elif any(keyword in message_lower for keyword in ['yes']) and not any(negative in message_lower for negative in ['no', 'not', 'wrong', 'incorrect']):
+        if unverified_doc_key:
+            intent_type = 'document_verified'
+            verification_status = 'confirmed'
+    # Apply verification update if classified as verified (after corrections flow)
+    if intent_type == 'document_verified' and unverified_doc_key:
+        try:
+            client_verify = _connect_mongo()
+            db_verify = client_verify['chats']
+            coll_verify = db_verify[user_id]
+            # Merge any pending correctedData into extractedData atomically
+            session_to_verify = new_session_generated if new_session_generated else session_id
+            doc_for_merge = coll_verify.find_one({'sessionId': session_to_verify}, {f'context.{unverified_doc_key}': 1}) or {}
+            doc_context_obj = (doc_for_merge.get('context') or {}).get(unverified_doc_key, {})
+            pending_corr = doc_context_obj.get('correctedData') or {}
+            set_ops = {f'context.{unverified_doc_key}.isVerified': 'verified'}
+            # Prepare field updates only if corrections exist
+            for k, v in pending_corr.items():
+                set_ops[f'context.{unverified_doc_key}.extractedData.{k}'] = v
+            update_doc = {'$set': set_ops, '$unset': {f'context.{unverified_doc_key}.correctedData': ""}}
+            coll_verify.update_one({'sessionId': session_to_verify}, update_doc)
+            if _should_log():
+                logger.info('Document verified and corrections merged (status updated): %s merged_fields=%s', unverified_doc_key, list(pending_corr.keys()))
+        except Exception as e:
+            if _should_log():
+                logger.error('Failed to update document verification status: %s', str(e))
+        finally:
+            try:
+                client_verify.close()
+            except Exception:
+                pass
+
+    # If corrections provided branch (reparsed inside branch to capture corrections precisely)
+    if unverified_doc_key and intent_type == 'document_correction_provided':
+        # User is providing corrections (flexible detection)
+        if _should_log():
+            logger.info('Applying corrections for document: %s', unverified_doc_key)
+        try:
+            client_correct = _connect_mongo()
+            db_correct = client_correct['chats']
+            coll_correct = db_correct[user_id]
+            current_data = unverified_doc_data.get('extractedData', {})
+            raw_corrections = _parse_document_corrections(message, current_data)
+            corrections_made = {}
+            for field, corrected_value in raw_corrections.items():
+                # Strip trailing filler phrases like 'others correct'
+                import re as _re
+                cleaned_val = _re.sub(r"\b(others?|the rest)( are| is)?( all)? (correct|ok|okay|right)\b", "", corrected_value, flags=_re.IGNORECASE).strip()
+                original_value = current_data.get(field, '')
+                formatted_value = cleaned_val
+                if original_value and original_value.isupper():
+                    formatted_value = cleaned_val.upper()
+                elif original_value and original_value.islower():
+                    formatted_value = cleaned_val.lower()
+                elif original_value and original_value.istitle():
+                    formatted_value = cleaned_val.title()
+                corrections_made[field] = formatted_value
+                if _should_log():
+                    logger.info('Correction parsed - %s: "%s" -> "%s"', field, original_value, formatted_value)
+            if corrections_made:
+                session_to_correct = new_session_generated if new_session_generated else session_id
+                # Store corrections separately; do NOT merge into extractedData yet
+                coll_correct.update_one({'sessionId': session_to_correct}, {
+                    '$set': {
+                        f'context.{unverified_doc_key}.correctedData': corrections_made,
+                        f'context.{unverified_doc_key}.isVerified': 'correcting'
+                    }
+                })
+                # Refresh local reference for prompt generation later (keep extractedData original)
+                unverified_doc_data['correctedData'] = corrections_made
+                unverified_doc_data['isVerified'] = 'correcting'
+            else:
+                if _should_log():
+                    logger.warning('No corrections could be parsed from message (intent kept).')
+        except Exception as e:
+            if _should_log():
+                logger.error('Error applying corrections: %s', str(e))
+        finally:
+            try:
+                client_correct.close()
+            except Exception:
+                pass
     
     if attachments:
         # Process the first attachment (image document)
@@ -637,16 +1292,16 @@ def lambda_handler(event, context):
                 # Document is clear, set intent type and save context to session
                 intent_type = 'document_processing'
                 session_to_save = new_session_generated if new_session_generated else session_id
-                _save_document_context_to_session(user_id, session_to_save, ocr_result, attachment['name'], created_at_iso)
+                _save_document_context_to_session(user_id, session_to_save, ocr_result, attachment['name'])
                 
                 if _should_log():
                     logger.info('Document processed successfully. Category: %s, Intent type: %s', 
-                               ocr_result.get('category_detection', {}).get('detected_category', 'unknown'), intent_type)
+                                ocr_result.get('category_detection', {}).get('detected_category', 'unknown'), intent_type)
 
     # Determine prompt for Bedrock. For first-time connection, request a welcome message.
     try:
         if _should_log():
-            logger.info('Generating prompt. Intent type: %s', intent_type or 'None')
+            logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
             
         if session_id == '(new-session)':
             prompt = (
@@ -663,13 +1318,126 @@ def lambda_handler(event, context):
             prompt = _generate_document_analysis_prompt(ocr_result, message)
         elif intent_type == 'document_verified':
             # User has verified the document data, now provide services
+            # Include verified document context for personalized service recommendations
+            verified_doc_context = "{}"
+            if unverified_doc_data:
+                verified_doc_context = json.dumps(unverified_doc_data, indent=2, default=str)
+            
             prompt = (
                 "SYSTEM: The user has verified that the extracted document information is correct. "
                 "Now provide specific MyGovHub services and next steps based on the verified document data. "
                 "Be helpful and specific about what government services are available. "
+                "\nVerified document context:\n"
+                f"{verified_doc_context}\n\n"
                 f"User message: {message}\n\n"
-                "NOTE: If you include a signature, use 'MyGovHub Support Team' only. Do not use placeholders like '[Your Name]' or similar."
+                "NOTE: userId represents the Identity Card (IC) number. If you include a signature, use 'MyGovHub Support Team' only."
             )
+        elif intent_type == 'document_correction_needed':
+            # User said the information is wrong, ask for specifics
+            extracted_data = unverified_doc_data.get('extractedData', {}) if unverified_doc_data else {}
+            
+            # Generate field examples based on actual OCR API fields
+            field_mapping = {
+                'full_name': 'Full Name',
+                'userId': 'IC Number',
+                'gender': 'Gender', 
+                'address': 'Address',
+                'licenses_number': 'License Number',
+                'account_number': 'Account Number',
+                'invoice_number': 'Invoice Number'
+            }
+            
+            field_examples = []
+            for field_key, field_value in extracted_data.items():
+                friendly_name = field_mapping.get(field_key, field_key.replace('_', ' ').title())
+                field_examples.append(f"{friendly_name}: [correct {friendly_name.lower()}]")
+            
+            format_example = '\n'.join(field_examples) if field_examples else "Field Name: [correct value]"
+            data_summary = '\n'.join([f'- {field_mapping.get(key, key.replace("_", " ").title())}: {value}' for key, value in extracted_data.items()])
+            
+            # Include full document context for AI understanding
+            doc_context = json.dumps(unverified_doc_data, indent=2, default=str) if unverified_doc_data else "{}"
+            
+            prompt = (
+                "SYSTEM: The user said 'No' which means the extracted document information is INCORRECT. "
+                "You MUST ask them to specify which fields are wrong and provide corrections. "
+                "DO NOT proceed with the current data - the user explicitly said it's wrong. "
+                "\nFull document context (for AI reference):\n"
+                f"{doc_context}\n\n"
+                "Current extracted data (user said this is WRONG):\n"
+                f"{data_summary}\n\n"
+                "REQUIRED RESPONSE: Ask the user exactly this:\n"
+                "'I understand the information is incorrect. Which fields need to be corrected? "
+                "Please provide the correct details in this format:\n\n"
+                f"{format_example}\n\n"
+                "You can correct multiple fields at once.'\n\n"
+                f"User message: {message}\n\n"
+                "NOTE: userId represents the Identity Card (IC) number. If you include a signature, use 'MyGovHub Support Team' only."
+            )
+        elif intent_type == 'document_correction_provided':
+            # User has provided corrections, show updated info and ask for confirmation
+            # Get the updated document data after corrections
+            try:
+                client_refresh = _connect_mongo()
+                db_refresh = client_refresh['chats']
+                coll_refresh = db_refresh[user_id]
+                session_to_get = new_session_generated if new_session_generated else session_id
+                updated_session = coll_refresh.find_one({'sessionId': session_to_get})
+                
+                if updated_session and unverified_doc_key in updated_session.get('context', {}):
+                    updated_data = updated_session['context'][unverified_doc_key].get('extractedData', {})
+                    
+                    if _should_log():
+                        logger.info('Retrieved updated data after corrections: %s', updated_data)
+                    
+                    # Use field mapping for user-friendly display
+                    field_mapping = {
+                        'full_name': 'Full Name',
+                        'userId': 'IC Number',
+                        'gender': 'Gender', 
+                        'address': 'Address',
+                        'licenses_number': 'License Number',
+                        'account_number': 'Account Number',
+                        'invoice_number': 'Invoice Number'
+                    }
+                    
+                    # If there are pending corrections (correctedData), overlay them for display only
+                    corrected_preview = updated_session['context'][unverified_doc_key].get('correctedData') or {}
+                    preview_data = dict(updated_data)
+                    preview_data.update(corrected_preview)  # overlay pending corrections
+                    formatted_data = []
+                    for key, value in preview_data.items():
+                        friendly_name = field_mapping.get(key, key.replace('_', ' ').title())
+                        formatted_data.append(f'- {friendly_name}: {value}')
+                    
+                    data_summary = '\n'.join(formatted_data)
+                    
+                    # Include full updated document context for AI reference
+                    updated_doc_context = updated_session['context'][unverified_doc_key]
+                    doc_context = json.dumps(updated_doc_context, indent=2, default=str)
+                    
+                    prompt = (
+                        "SYSTEM: The user has provided corrections. Show ONLY the updated information with pending corrections overlaid (not yet finalized) and ask for confirmation. "
+                        "DO NOT include technical details like timestamps, filenames, confidence scores, or verification status. "
+                        "Show ONLY the user-visible data.\n\n"
+                        "Updated information (including proposed corrections) to show user:\n"
+                        f"{data_summary}\n\n"
+                        "REQUIRED RESPONSE FORMAT:\n"
+                        "Thank you for the corrections. Here is the updated information (pending your confirmation):\n\n"
+                        f"{data_summary}\n\n"
+                        "Is this corrected information now accurate? Please reply YES to confirm.\n\n"
+                        "MyGovHub Support Team\n\n"
+                        f"User message: {message}\n\n"
+                        "NOTE: userId represents the Identity Card (IC) number. Keep response simple and user-friendly."
+                    )
+                else:
+                    prompt = f"SYSTEM: Error retrieving updated document data. User message: {message}"
+                    
+                client_refresh.close()
+            except Exception as e:
+                prompt = f"SYSTEM: Error processing corrections. User message: {message}"
+                if _should_log():
+                    logger.error('Failed to retrieve updated document data: %s', str(e))
         else:
             # Build a contextual prompt using previous messages and ekyc (if available)
             parts = []
