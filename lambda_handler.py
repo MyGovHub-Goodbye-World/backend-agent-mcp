@@ -201,6 +201,13 @@ def lambda_handler(event, context):
                 # If collection creation fails, it may already exist (race) or be unsupported
                 pass
         coll = db[user_id]
+        # Attempt to fetch existing session document so we can provide history/ekyc to the model
+        session_doc = None
+        if session_id and session_id != '(new-session)':
+            try:
+                session_doc = coll.find_one({'sessionId': session_id})
+            except Exception:
+                session_doc = None
         if session_id == '(new-session)':
             new_session_generated = str(uuid.uuid4())
             # Archive any other active sessions for this user
@@ -229,6 +236,23 @@ def lambda_handler(event, context):
                 update_ops['ekyc'] = ekyc
             if update_ops:
                 coll.update_one({'sessionId': session_id}, {'$set': update_ops})
+            # If session_doc exists and is archived, return a restart message and instruct client to start a new session
+            if session_doc and session_doc.get('status') == 'archived':
+                special_msg = (
+                    "It seems like you have another chat activate, please log out from the other device. "
+                    "Conversation will be restarted."
+                )
+                resp_body = {
+                    'status': {'statusCode': 200, 'message': 'Success'},
+                    'data': {
+                        'messageId': message_id,
+                        'message': special_msg,
+                        'createdAt': created_at_z,
+                        'sessionId': '(new-session)',
+                        'attachment': body.get('attachment') or []
+                    }
+                }
+                return _cors_response(200, resp_body)
     finally:
         try:
             client.close()
@@ -249,8 +273,33 @@ def lambda_handler(event, context):
                 "IMPORTANT: Respond ONLY with the welcome message text (no JSON, no explanations, no metadata)."
             )
         else:
-            # For regular messages, pass through the user's message to the model
-            prompt = message
+            # Build a contextual prompt using previous messages and ekyc (if available)
+            parts = []
+            # include any session-level ekyc data
+            if session_doc and session_doc.get('ekyc'):
+                try:
+                    ekyc_str = json.dumps(session_doc.get('ekyc'))
+                except Exception:
+                    ekyc_str = str(session_doc.get('ekyc'))
+                parts.append(f"EKYC: {ekyc_str}\n")
+
+            # include prior messages in chronological order
+            if session_doc and isinstance(session_doc.get('messages'), list):
+                for m in session_doc.get('messages'):
+                    role = m.get('role', 'user')
+                    # messages content expected to be a list of objects with 'text'
+                    content_parts = []
+                    for c in m.get('content', []):
+                        text = c.get('text') if isinstance(c, dict) else str(c)
+                        if text:
+                            content_parts.append(str(text))
+                    if content_parts:
+                        parts.append(f"{role.upper()}: {' '.join(content_parts)}\n")
+
+            # finally append the current user's message
+            parts.append(f"USER: {message}\n")
+            # join into one prompt string
+            prompt = "\n".join(parts)
 
         model_error = None
         response_text = None

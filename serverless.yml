@@ -28,17 +28,17 @@ provider:
   # HTTP API-level settings (CORS) so browser clients can call the endpoints directly.
   httpApi:
     cors:
-      allowOrigins:
+      allowedOrigins:
         - '*'
-      allowMethods:
+      allowedMethods:
         - GET
         - POST
         - OPTIONS
-      allowHeaders:
+      allowedHeaders:
         - Content-Type
         - Authorization
         - X-Requested-With
-      exposeHeaders:
+      exposedHeaders:
         - Content-Length
       allowCredentials: false
 
