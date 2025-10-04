@@ -6,6 +6,7 @@ import traceback
 
 import boto3
 from botocore.exceptions import ClientError
+import logging
 
 # optional dotenv already handled earlier in this file; ensure environment loaded
 try:
@@ -96,7 +97,59 @@ def _cors_response(status_code=200, body=None, content_type='application/json'):
             resp['body'] = json.dumps(body)
         else:
             resp['body'] = str(body)
+    # Log the response body for CloudWatch (safe to log - redact if needed)
+    try:
+        # If the body is a JSON string, parse it so we log an object instead of an escaped string
+        raw_body = resp.get('body')
+        parsed_body = None
+        if isinstance(raw_body, str):
+            try:
+                parsed_body = json.loads(raw_body)
+            except Exception:
+                parsed_body = None
+
+        if parsed_body is not None:
+            # If the parsed body matches our API shape, log it exactly as returned
+            try:
+                # prefer to log with keys in order: status then data when present
+                ordered = None
+                if isinstance(parsed_body, dict) and 'status' in parsed_body and 'data' in parsed_body:
+                    ordered = {'status': parsed_body.get('status'), 'data': parsed_body.get('data')}
+                else:
+                    ordered = parsed_body
+                logger.info('Response sent: %s', json.dumps(ordered, indent=2, default=str))
+            except Exception:
+                logger.info('Response sent: %s', json.dumps(parsed_body, indent=2, default=str))
+        else:
+            log_resp = {'statusCode': status_code, 'body': raw_body}
+            logger.info('Response sent: %s', json.dumps(log_resp))
+    except Exception:
+        logger.exception('Failed to log response')
+
     return resp
+
+
+# Initialize logger for CloudWatch
+logger = logging.getLogger('lambda_handler')
+logger.setLevel(logging.INFO)
+
+def _log_request(event, body_obj=None):
+    try:
+        request_context = event.get('requestContext', {})
+        http = request_context.get('http') or {}
+        path = http.get('path') if isinstance(http, dict) else event.get('rawPath') or event.get('path')
+        method = http.get('method') if isinstance(http, dict) else event.get('httpMethod')
+        log_obj = {
+            'path': path,
+            'method': method,
+        }
+        if body_obj is not None:
+            log_obj['body'] = body_obj
+        else:
+            log_obj['body'] = event.get('body')
+        logger.info('Request received: %s', json.dumps(log_obj))
+    except Exception:
+        logger.exception('Failed to log request')
 
 def _connect_mongo():
     """Create a MongoDB client using ATLAS_URI from env.
@@ -163,10 +216,15 @@ def lambda_handler(event, context):
         try:
             body = json.loads(body)
         except Exception:
+            _log_request(event)
             return _cors_response(400, {'error': 'Invalid JSON body'})
 
     if not isinstance(body, dict):
+        _log_request(event)
         return _cors_response(400, {'error': 'Request body must be a JSON object'})
+
+    # Log the request (include parsed body)
+    _log_request(event, body)
 
     # Validate required fields
     user_id = body.get('userId')
@@ -205,8 +263,22 @@ def lambda_handler(event, context):
         session_doc = None
         if session_id and session_id != '(new-session)':
             try:
+                logger.info('Fetching session from MongoDB: user=%s sessionId=%s', user_id, session_id)
                 session_doc = coll.find_one({'sessionId': session_id})
+                if session_doc:
+                    status_val = session_doc.get('status')
+                    messages_count = len(session_doc.get('messages') or [])
+                    has_ekyc = bool(session_doc.get('ekyc'))
+                    logger.info('Fetched session: user=%s sessionId=%s status=%s messages=%d ekyc=%s', user_id, session_id, status_val, messages_count, has_ekyc)
+                    # Log the full session document (always)
+                    try:
+                        logger.info('Full session document: %s', json.dumps(session_doc, default=str))
+                    except Exception:
+                        logger.exception('Failed to log full session document')
+                else:
+                    logger.info('No session document found for user=%s sessionId=%s', user_id, session_id)
             except Exception:
+                logger.exception('Error fetching session document for user=%s sessionId=%s', user_id, session_id)
                 session_doc = None
         if session_id == '(new-session)':
             new_session_generated = str(uuid.uuid4())
