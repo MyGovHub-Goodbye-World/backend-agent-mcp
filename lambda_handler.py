@@ -164,6 +164,28 @@ def _log_request(event, body_obj=None):
     except Exception:
         logger.exception('Failed to log request')
 
+
+def _detect_service_intent(message_lower: str):
+    """Detect high-level service intents from a free-form user message.
+
+    Returns one of: 'renew_license', 'pay_tnb_bill' or None.
+    Detection is conservative: requires presence of key verbs + domain terms.
+    """
+    if not message_lower:
+        return None
+
+    # Driving license renewal
+    if any(k in message_lower for k in ['renew', 'renewal', 'renewing']) and \
+       any(k in message_lower for k in ['license', 'driving license', 'lesen', 'driver license']):
+        return 'renew_license'
+
+    # TNB bill payment (Tenaga Nasional Berhad - Malaysia electric utility)
+    if any(k in message_lower for k in ['pay', 'payment', 'bayar']) and \
+       any(k in message_lower for k in ['tnb', 'electric', 'electricity', 'bill', 'bil elektrik']):
+        return 'pay_tnb_bill'
+
+    return None
+
 def _connect_mongo():
     """Create a MongoDB client using ATLAS_URI from env.
 
@@ -1046,7 +1068,7 @@ def lambda_handler(event, context):
                 'createdAt': created_at_iso,
                 'messages': [],
                 'status': 'active',
-                'topic': '',
+                'service': '',  # service identifier e.g. renew_license, pay_tnb_bill
                 'context': {},
                 'ekyc': ekyc or {}
             }
@@ -1258,6 +1280,33 @@ def lambda_handler(event, context):
             except Exception:
                 pass
     
+    # --------------------------------------------------------------
+    # Service intent detection (only if no document-processing intent determined)
+    # --------------------------------------------------------------
+    service_intent = None
+    if not intent_type and attachments == []:  # pure text request
+        service_intent = _detect_service_intent(message_lower)
+        if service_intent == 'renew_license':
+            intent_type = 'renew_license'
+        elif service_intent == 'pay_tnb_bill':
+            intent_type = 'pay_tnb_bill'
+
+    # If we have a service intent, update session 'service' field (v1: no legacy topic handling)
+    if service_intent in ('renew_license', 'pay_tnb_bill'):
+        try:
+            client_service = _connect_mongo()
+            db_service = client_service['chats']
+            coll_service = db_service[user_id]
+            session_to_service = new_session_generated if new_session_generated else session_id
+            coll_service.update_one({'sessionId': session_to_service}, {'$set': {'service': service_intent}})
+        except Exception:
+            pass
+        finally:
+            try:
+                client_service.close()
+            except Exception:
+                pass
+
     if attachments:
         # Process the first attachment (image document)
         attachment = attachments[0]
@@ -1438,6 +1487,26 @@ def lambda_handler(event, context):
                 prompt = f"SYSTEM: Error processing corrections. User message: {message}"
                 if _should_log():
                     logger.error('Failed to retrieve updated document data: %s', str(e))
+        elif intent_type == 'renew_license':
+            prompt = (
+                "SYSTEM: Respond with ONLY the following guidance (no extra elaboration beyond minor natural phrasing allowed).\n\n"
+                "USER-FACING MESSAGE:\n"
+                "I can help you renew your driving license!\n\n"
+                "To proceed with the renewal, I need to verify your identity and current license details. Please upload one of the following documents:\n\n"
+                "📸 Option 1: Your current driving license (photo of the front side)\n"
+                "📸 Option 2: Your IC (Identity Card) - front side\n\n"
+                "Please take a clear photo and send it to me. I'll extract the necessary information to process your license renewal.\n"
+                "If you already uploaded a document earlier and it's verified, just reply YES to proceed with renewal steps."
+            )
+        elif intent_type == 'pay_tnb_bill':
+            prompt = (
+                "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+                "USER-FACING MESSAGE:\n"
+                "I can help you pay your TNB electricity bill! ⚡\n\n"
+                "To process your bill payment, I need to verify your account details and bill information. Please upload:\n\n"
+                "📸 TNB Bill Document: Take a photo of your TNB bill (the upper portion showing your account number and amount due)\n\n"
+                "Please ensure the photo is clear and all important details are visible. I'll extract the account information to help you with the payment process."
+            )
         else:
             # Build a contextual prompt using previous messages and ekyc (if available)
             parts = []
