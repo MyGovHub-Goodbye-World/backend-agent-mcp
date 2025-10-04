@@ -262,7 +262,8 @@ def _save_document_context_to_session(user_id, session_id, ocr_result, attachmen
                 'extractedData': extracted_data,
                 'categoryDetection': category_detection,
                 'processedAt': processed_at_iso,
-                'filename': attachment_name  # Keep original filename for reference
+                'filename': attachment_name,  # Keep original filename for reference
+                'isVerified': False  # Requires user verification before proceeding
             }
         }
         
@@ -373,7 +374,10 @@ def _generate_document_analysis_prompt(ocr_result, user_message):
         else:
             prompt_parts.append("User uploaded a document without additional message.")
         prompt_parts.append("")
-        prompt_parts.append("Please provide a helpful response based on the document analysis and user's needs. Be specific about what MyGovHub services might be relevant.")
+        prompt_parts.append("IMPORTANT: After analyzing the document, ask the user to verify the extracted information is correct.")
+        prompt_parts.append("Include a clear message asking: 'Please review the extracted information above and confirm if it is accurate by replying with YES or CORRECT.'")
+        prompt_parts.append("")
+        prompt_parts.append("Only after user verification can you proceed with specific MyGovHub services.")
         prompt_parts.append("")
         prompt_parts.append("NOTE: If you include a signature, use 'MyGovHub Support Team' only. Do not use placeholders like '[Your Name]' or similar.")
         
@@ -563,6 +567,43 @@ def lambda_handler(event, context):
     ocr_result = None
     intent_type = None
     
+    # Check if this is a document verification request (user confirming extracted data)
+    if message.lower().strip() in ['yes', 'correct', 'verified', 'confirm', 'looks good', 'accurate']:
+        # Look for unverified documents in the session context
+        if session_doc and session_doc.get('context'):
+            for key, doc_data in session_doc['context'].items():
+                if key.startswith('document_') and not doc_data.get('isVerified', True):
+                    intent_type = 'document_verified'
+                    # Mark the document as verified
+                    try:
+                        client_verify = _connect_mongo()
+                        db_verify = client_verify['chats']
+                        coll_verify = db_verify[user_id]
+                        
+                        verification_update = {
+                            f'context.{key}.isVerified': True,
+                            f'context.{key}.verifiedAt': created_at_iso
+                        }
+                        
+                        session_to_verify = new_session_generated if new_session_generated else session_id
+                        coll_verify.update_one(
+                            {'sessionId': session_to_verify}, 
+                            {'$set': verification_update}
+                        )
+                        
+                        if _should_log():
+                            logger.info('Document verified by user: %s', key)
+                            
+                    except Exception as e:
+                        if _should_log():
+                            logger.error('Failed to update document verification: %s', str(e))
+                    finally:
+                        try:
+                            client_verify.close()
+                        except Exception:
+                            pass
+                    break
+    
     if attachments:
         # Process the first attachment (image document)
         attachment = attachments[0]
@@ -621,6 +662,15 @@ def lambda_handler(event, context):
         elif intent_type == 'document_processing' and ocr_result:
             # Use document analysis prompt for processed documents
             prompt = _generate_document_analysis_prompt(ocr_result, message)
+        elif intent_type == 'document_verified':
+            # User has verified the document data, now provide services
+            prompt = (
+                "SYSTEM: The user has verified that the extracted document information is correct. "
+                "Now provide specific MyGovHub services and next steps based on the verified document data. "
+                "Be helpful and specific about what government services are available. "
+                f"User message: {message}\n\n"
+                "NOTE: If you include a signature, use 'MyGovHub Support Team' only. Do not use placeholders like '[Your Name]' or similar."
+            )
         else:
             # Build a contextual prompt using previous messages and ekyc (if available)
             parts = []
