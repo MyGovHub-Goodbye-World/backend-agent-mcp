@@ -13,6 +13,8 @@ provider:
     BEDROCK_TEMPERATURE: ${env:BEDROCK_TEMPERATURE, 0.5}
     BEDROCK_TOP_P: ${env:BEDROCK_TOP_P, 0.8}
 
+    SHOW_CLOUDWATCH_LOGS: ${env:SHOW_CLOUDWATCH_LOGS, 'false'}
+
     ATLAS_URI: ${env:ATLAS_URI}
     ATLAS_DB: ${env:ATLAS_DB, 'databases'}
   iam:

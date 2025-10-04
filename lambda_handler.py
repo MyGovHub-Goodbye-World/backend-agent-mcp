@@ -117,12 +117,15 @@ def _cors_response(status_code=200, body=None, content_type='application/json'):
                     ordered = {'status': parsed_body.get('status'), 'data': parsed_body.get('data')}
                 else:
                     ordered = parsed_body
-                logger.info('Response sent: %s', json.dumps(ordered, indent=2, default=str))
+                if _should_log():
+                    logger.info('Response sent: %s', json.dumps(ordered, indent=2, default=str))
             except Exception:
-                logger.info('Response sent: %s', json.dumps(parsed_body, indent=2, default=str))
+                if _should_log():
+                    logger.info('Response sent: %s', json.dumps(parsed_body, indent=2, default=str))
         else:
             log_resp = {'statusCode': status_code, 'body': raw_body}
-            logger.info('Response sent: %s', json.dumps(log_resp))
+            if _should_log():
+                logger.info('Response sent: %s', json.dumps(log_resp))
     except Exception:
         logger.exception('Failed to log response')
 
@@ -132,6 +135,13 @@ def _cors_response(status_code=200, body=None, content_type='application/json'):
 # Initialize logger for CloudWatch
 logger = logging.getLogger('lambda_handler')
 logger.setLevel(logging.INFO)
+
+
+def _should_log():
+    try:
+        return os.getenv('SHOW_CLOUDWATCH_LOGS', 'false').lower() in ('1', 'true', 'yes')
+    except Exception:
+        return False
 
 def _log_request(event, body_obj=None):
     try:
@@ -147,7 +157,8 @@ def _log_request(event, body_obj=None):
             log_obj['body'] = body_obj
         else:
             log_obj['body'] = event.get('body')
-        logger.info('Request received: %s', json.dumps(log_obj))
+        if _should_log():
+            logger.info('Request received: %s', json.dumps(log_obj))
     except Exception:
         logger.exception('Failed to log request')
 
@@ -157,7 +168,7 @@ def _connect_mongo():
     Raises RuntimeError if ATLAS_URI is missing or the connection cannot be established.
     Returns a pymongo.MongoClient on success.
     """
-    atlas_uri = os.getenv('ATLAS_URI')
+    atlas_uri = os.getenv('ATLAS_URI') + '?retryWrites=true&w=majority'
     if not atlas_uri:
         raise RuntimeError('ATLAS_URI environment variable is not set')
     try:
@@ -263,20 +274,24 @@ def lambda_handler(event, context):
         session_doc = None
         if session_id and session_id != '(new-session)':
             try:
-                logger.info('Fetching session from MongoDB: user=%s sessionId=%s', user_id, session_id)
+                if _should_log():
+                    logger.info('Fetching session from MongoDB: user=%s sessionId=%s', user_id, session_id)
                 session_doc = coll.find_one({'sessionId': session_id})
                 if session_doc:
                     status_val = session_doc.get('status')
                     messages_count = len(session_doc.get('messages') or [])
                     has_ekyc = bool(session_doc.get('ekyc'))
-                    logger.info('Fetched session: user=%s sessionId=%s status=%s messages=%d ekyc=%s', user_id, session_id, status_val, messages_count, has_ekyc)
+                    if _should_log():
+                        logger.info('Fetched session: user=%s sessionId=%s status=%s messages=%d ekyc=%s', user_id, session_id, status_val, messages_count, has_ekyc)
                     # Log the full session document (always)
                     try:
-                        logger.info('Full session document: %s', json.dumps(session_doc, default=str))
+                        if _should_log():
+                            logger.info('Full session document: %s', json.dumps(session_doc, default=str))
                     except Exception:
                         logger.exception('Failed to log full session document')
                 else:
-                    logger.info('No session document found for user=%s sessionId=%s', user_id, session_id)
+                    if _should_log():
+                        logger.info('No session document found for user=%s sessionId=%s', user_id, session_id)
             except Exception:
                 logger.exception('Error fetching session document for user=%s sessionId=%s', user_id, session_id)
                 session_doc = None
