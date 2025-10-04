@@ -3,6 +3,8 @@ import os
 import uuid
 from datetime import datetime, timezone
 import traceback
+import base64
+import requests
 
 import boto3
 from botocore.exceptions import ClientError
@@ -180,6 +182,204 @@ def _connect_mongo():
         raise RuntimeError(f'Failed to connect to MongoDB: {e}')
 
 
+def _process_document_attachment(attachment):
+    """Process document attachment by calling OCR_ANALYZE_API_URL.
+    
+    Args:
+        attachment: dict with 'url' and 'name' fields
+        
+    Returns:
+        dict: OCR analysis result or None if processing fails
+    """
+    try:
+        ocr_api_url = os.getenv('OCR_ANALYZE_API_URL')
+        if not ocr_api_url:
+            raise RuntimeError('OCR_ANALYZE_API_URL environment variable is not set')
+        
+        # Fetch image from URL
+        response = requests.get(attachment['url'], timeout=30)
+        response.raise_for_status()
+        
+        # Convert to base64
+        file_content = base64.b64encode(response.content).decode('utf-8')
+        
+        # Prepare payload for OCR API
+        payload = {
+            'file_content': file_content,
+            'filename': attachment['name']
+        }
+        
+        # Call OCR API
+        ocr_response = requests.post(
+            ocr_api_url,
+            json=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=60
+        )
+        ocr_response.raise_for_status()
+        
+        ocr_result = ocr_response.json()
+        
+        # Log OCR API response to CloudWatch
+        if _should_log():
+            logger.info('OCR API response for file %s: %s', 
+                       attachment['name'], 
+                       json.dumps(ocr_result, indent=2, default=str))
+        
+        return ocr_result
+        
+    except Exception as e:
+        if _should_log():
+            logger.error('Failed to process document attachment: %s', str(e))
+        return None
+
+
+def _save_document_context_to_session(user_id, session_id, ocr_result, attachment_name):
+    """Save extracted document data to the session context in MongoDB.
+    
+    Args:
+        user_id: User ID
+        session_id: Session ID
+        ocr_result: OCR analysis result
+        attachment_name: Original attachment filename
+    """
+    try:
+        client = _connect_mongo()
+        db = client['chats']
+        coll = db[user_id]
+        
+        # Prepare context data with extracted information
+        extracted_data = ocr_result.get('extracted_data', {})
+        category_detection = ocr_result.get('category_detection', {})
+        
+        # Update the session document's context with extracted data
+        context_update = {
+            f'context.document_{attachment_name}': {
+                'extractedData': extracted_data,
+                'categoryDetection': category_detection,
+                'processedAt': datetime.now(timezone.utc).isoformat(),
+                'filename': attachment_name
+            }
+        }
+        
+        coll.update_one(
+            {'sessionId': session_id}, 
+            {'$set': context_update}
+        )
+        
+        if _should_log():
+            logger.info('Saved document context to session: user=%s session=%s filename=%s', 
+                       user_id, session_id, attachment_name)
+        
+    except Exception as e:
+        if _should_log():
+            logger.error('Failed to save document context to session: %s', str(e))
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _check_document_quality(ocr_result):
+    """Check if document is blurry based on OCR analysis results.
+    
+    Args:
+        ocr_result: OCR analysis result dict
+        
+    Returns:
+        tuple: (is_blurry: bool, blur_message: str or None)
+    """
+    try:
+        blur_analysis = ocr_result.get('blur_analysis', {})
+        overall_assessment = blur_analysis.get('overall_assessment', {})
+        is_blurry = overall_assessment.get('is_blurry', False)
+        
+        if is_blurry:
+            return True, "The document image appears to be blurry or unclear. Please take a clearer photo and send the document again for better processing."
+        
+        return False, None
+        
+    except Exception as e:
+        if _should_log():
+            logger.error('Failed to check document quality: %s', str(e))
+        return False, None
+
+
+def _generate_document_analysis_prompt(ocr_result, user_message):
+    """Generate appropriate prompt for document processing based on category detection.
+    
+    Args:
+        ocr_result: OCR analysis result dict
+        user_message: Original user message
+        
+    Returns:
+        str: Generated prompt for the AI model
+    """
+    try:
+        category_detection = ocr_result.get('category_detection', {})
+        detected_category = category_detection.get('detected_category', 'unknown')
+        confidence = category_detection.get('confidence', 0)
+        
+        extracted_data = ocr_result.get('extracted_data', {})
+        text_content = ocr_result.get('text', [])
+        
+        # Extract meaningful text from OCR results
+        text_parts = []
+        for text_item in text_content:
+            if isinstance(text_item, dict) and text_item.get('text'):
+                text_parts.append(text_item['text'])
+        
+        extracted_text = ' '.join(text_parts) if text_parts else ''
+        
+        prompt_parts = [
+            f"SYSTEM: You are processing a document for a government services portal (MyGovHub).",
+            f"Document category detected: {detected_category} (confidence: {confidence:.2f})",
+            f"Intent type: document_processing",
+            ""
+        ]
+        
+        if extracted_data:
+            prompt_parts.append("Extracted structured data:")
+            for key, value in extracted_data.items():
+                prompt_parts.append(f"- {key}: {value}")
+            prompt_parts.append("")
+        
+        if extracted_text:
+            prompt_parts.append(f"Document text content: {extracted_text[:1000]}...")  # Limit length
+            prompt_parts.append("")
+        
+        # Category-specific guidance
+        category_guidance = {
+            'receipt': "This appears to be a receipt. Help the user understand the transaction details and offer relevant government services like expense reporting or tax documentation.",
+            'invoice': "This appears to be an invoice. Assist with business registration, tax filing, or payment verification services.",
+            'license': "This appears to be a license document. Help with renewal processes, verification, or related permit applications.",
+            'permit': "This appears to be a permit document. Assist with permit renewals, status checks, or related applications.",
+            'identification': "This appears to be an identification document. Help with identity verification, document renewal, or related services.",
+            'bill': "This appears to be a utility or service bill. Assist with bill payment services or account verification.",
+            'form': "This appears to be a government form. Help with form completion, submission, or status tracking.",
+        }
+        
+        guidance = category_guidance.get(detected_category, "Analyze the document and provide relevant assistance based on the content.")
+        prompt_parts.append(f"Guidance: {guidance}")
+        prompt_parts.append("")
+        
+        if user_message.strip():
+            prompt_parts.append(f"User message: {user_message}")
+        else:
+            prompt_parts.append("User uploaded a document without additional message.")
+        prompt_parts.append("")
+        prompt_parts.append("Please provide a helpful response based on the document analysis and user's needs. Be specific about what MyGovHub services might be relevant.")
+        
+        return '\n'.join(prompt_parts)
+        
+    except Exception as e:
+        if _should_log():
+            logger.error('Failed to generate document analysis prompt: %s', str(e))
+        # Fallback prompt
+        return f"SYSTEM: Document processing completed. User message: {user_message}. Please provide assistance based on the uploaded document."
+
+
 def lambda_handler(event, context):
     """Handle new request format and return MCP-style response.
 
@@ -239,12 +439,17 @@ def lambda_handler(event, context):
 
     # Validate required fields
     user_id = body.get('userId')
-    message = body.get('message')
+    message = body.get('message', '')  # Default to empty string if not provided
     session_id = body.get('sessionId')
     ekyc = body.get('ekyc') or {}
+    attachments = body.get('attachment', [])
 
-    if not user_id or not message or session_id is None:
-        return _cors_response(400, {'error': "Missing required fields: 'userId', 'message', or 'sessionId'"})
+    # Allow empty message if there are attachments (document upload scenario)
+    if not user_id or session_id is None:
+        return _cors_response(400, {'error': "Missing required fields: 'userId' or 'sessionId'"})
+    
+    if not message and not attachments:
+        return _cors_response(400, {'error': "Either 'message' or 'attachment' must be provided"})
 
     # Generate a messageId for this incoming message
     message_id = str(uuid.uuid4())
@@ -282,13 +487,13 @@ def lambda_handler(event, context):
                     messages_count = len(session_doc.get('messages') or [])
                     has_ekyc = bool(session_doc.get('ekyc'))
                     if _should_log():
-                        logger.info('Fetched session: user=%s sessionId=%s status=%s messages=%d ekyc=%s', user_id, session_id, status_val, messages_count, has_ekyc)
-                    # Log the full session document (always)
+                        logger.info('Fetched session from MongoDB: user=%s sessionId=%s status=%s messages=%d ekyc=%s', user_id, session_id, status_val, messages_count, has_ekyc)
+                    # Log the full session document from MongoDB (always)
                     try:
                         if _should_log():
-                            logger.info('Full session document: %s', json.dumps(session_doc, default=str))
+                            logger.info('Full session document from MongoDB: %s', json.dumps(session_doc, default=str))
                     except Exception:
-                        logger.exception('Failed to log full session document')
+                        logger.exception('Failed to log full session document from MongoDB')
                 else:
                     if _should_log():
                         logger.info('No session document found for user=%s sessionId=%s', user_id, session_id)
@@ -346,9 +551,55 @@ def lambda_handler(event, context):
         except Exception:
             pass
 
-    # Determine prompt for Bedrock. For first-time connection, request a welcome message.
+    # Check for document attachments and process them
+    ocr_result = None
+    intent_type = None
+    
+    if attachments:
+        # Process the first attachment (image document)
+        attachment = attachments[0]
+        if attachment.get('url') and attachment.get('name'):
+            if _should_log():
+                logger.info('Processing document attachment: %s', attachment['name'])
+            
+            # Call OCR API to process the document
+            ocr_result = _process_document_attachment(attachment)
+            
+            if ocr_result:
+                # Check if document is blurry
+                is_blurry, blur_message = _check_document_quality(ocr_result)
+                
+                if is_blurry:
+                    # Return early with blur message
+                    if _should_log():
+                        logger.info('Document is blurry. Intent type: document_quality_issue')
+                    resp_body = {
+                        'status': {'statusCode': 200, 'message': 'Success'},
+                        'data': {
+                            'messageId': message_id,
+                            'message': blur_message,
+                            'createdAt': created_at_z,
+                            'sessionId': session_id if session_id != '(new-session)' else new_session_generated,
+                            'attachment': attachments,
+                            'intent_type': 'document_quality_issue'
+                        }
+                    }
+                    return _cors_response(200, resp_body)
+                
+                # Document is clear, set intent type and save context to session
+                intent_type = 'document_processing'
+                session_to_save = new_session_generated if new_session_generated else session_id
+                _save_document_context_to_session(user_id, session_to_save, ocr_result, attachment['name'])
+                
+                if _should_log():
+                    logger.info('Document processed successfully. Category: %s, Intent type: %s', 
+                               ocr_result.get('category_detection', {}).get('detected_category', 'unknown'), intent_type)
+
     # Determine prompt for Bedrock. For first-time connection, request a welcome message.
     try:
+        if _should_log():
+            logger.info('Generating prompt. Intent type: %s', intent_type or 'None')
+            
         if session_id == '(new-session)':
             prompt = (
                 "SYSTEM: You are a friendly assistant that composes a short welcome message "
@@ -359,6 +610,9 @@ def lambda_handler(event, context):
                 "'How can I help you today?'.\n\n"
                 "IMPORTANT: Respond ONLY with the welcome message text (no JSON, no explanations, no metadata)."
             )
+        elif intent_type == 'document_processing' and ocr_result:
+            # Use document analysis prompt for processed documents
+            prompt = _generate_document_analysis_prompt(ocr_result, message)
         else:
             # Build a contextual prompt using previous messages and ekyc (if available)
             parts = []
@@ -405,14 +659,46 @@ def lambda_handler(event, context):
             coll2 = db2[user_id]
 
             # push the user message (always)
-            user_msg_doc = {'role': 'user', 'content': [{'text': str(message)}]}
+            user_msg_doc = {
+                'messageId': message_id,
+                'message': str(message),
+                'timestamp': created_at_iso,
+                'type': 'user',
+                'role': 'user',
+                'content': [{'text': str(message)}]
+            }
+            
+            # Add attachment and intent if present
+            if attachments:
+                user_msg_doc['attachment'] = attachments
+            if intent_type:
+                user_msg_doc['intent'] = intent_type
+                
             coll2.update_one({'sessionId': session_to_update}, {'$push': {'messages': user_msg_doc}}, upsert=True)
 
             # push the assistant message; if model failed, store an error message as assistant reply
+            assistant_message_id = str(uuid.uuid4())
+            assistant_timestamp = datetime.now(timezone.utc).isoformat()
+            
             if response_text is not None:
-                assistant_msg_doc = {'role': 'assistant', 'content': [{'text': str(response_text)}]}
+                assistant_msg_doc = {
+                    'messageId': assistant_message_id,
+                    'message': str(response_text),
+                    'timestamp': assistant_timestamp,
+                    'type': 'assistant',
+                    'role': 'assistant',
+                    'content': [{'text': str(response_text)}]
+                }
             else:
-                assistant_msg_doc = {'role': 'assistant', 'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}], 'meta': {'modelError': model_error}}
+                assistant_msg_doc = {
+                    'messageId': assistant_message_id,
+                    'message': 'ERROR: assistant failed to respond. See modelError in response.',
+                    'timestamp': assistant_timestamp,
+                    'type': 'assistant',
+                    'role': 'assistant',
+                    'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}],
+                    'meta': {'modelError': model_error}
+                }
 
             coll2.update_one({'sessionId': session_to_update}, {'$push': {'messages': assistant_msg_doc}}, upsert=True)
         except Exception as e:
@@ -444,6 +730,11 @@ def lambda_handler(event, context):
                 'attachment': body.get('attachment') or []
             }
         }
+
+        if intent_type:
+            resp_body['data']['intent_type'] = intent_type
+            if _should_log():
+                logger.info('Final response includes intent_type: %s', intent_type)
 
         if model_error:
             resp_body['data']['modelError'] = model_error

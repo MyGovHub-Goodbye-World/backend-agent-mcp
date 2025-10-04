@@ -15,6 +15,8 @@ provider:
 
     SHOW_CLOUDWATCH_LOGS: ${env:SHOW_CLOUDWATCH_LOGS, 'false'}
 
+    OCR_ANALYZE_API_URL: ${env:OCR_ANALYZE_API_URL}
+
     ATLAS_URI: ${env:ATLAS_URI}
     ATLAS_DB: ${env:ATLAS_DB, 'databases'}
   iam:
@@ -40,8 +42,6 @@ provider:
         - Content-Type
         - Authorization
         - X-Requested-With
-      exposedHeaders:
-        - Content-Length
       allowCredentials: false
 
 functions:
@@ -69,5 +69,5 @@ package:
 
 custom:
   pythonRequirements:
-    dockerizePip: true
+    dockerizePip: false
     zip: false
