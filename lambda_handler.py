@@ -1508,21 +1508,39 @@ def lambda_handler(event, context):
                 "Please ensure the photo is clear and all important details are visible. I'll extract the account information to help you with the payment process."
             )
         else:
-            # Build a contextual prompt using previous messages and ekyc (if available)
+            # Generic context-building order: 1) Document context summary 2) EKYC 3) Prior messages 4) Current user message
             parts = []
-            # include any session-level ekyc data
+            # 1. Document/context summary (only high-level; avoid dumping huge raw objects)
+            if session_doc:
+                ctx = session_doc.get('context') or {}
+                if ctx:
+                    # Summarize each document entry: ref + verification + key fields
+                    for key, doc_meta in list(ctx.items())[:5]:  # limit to first 5 to keep prompt small
+                        if not key.startswith('document_'):
+                            continue
+                        ver_status = doc_meta.get('isVerified')
+                        extracted = doc_meta.get('extractedData') or {}
+                        # show only a few stable fields
+                        field_snippets = []
+                        for f in ['full_name', 'userId', 'licenses_number', 'account_number', 'invoice_number']:
+                            if f in extracted:
+                                val = str(extracted.get(f))
+                                if len(val) > 40:
+                                    val = val[:37] + '...'
+                                field_snippets.append(f"{f}:{val}")
+                        snippet = ', '.join(field_snippets) if field_snippets else 'no key fields'
+                        parts.append(f"DOC {key} status={ver_status} {snippet}\n")
+            # 2. EKYC data
             if session_doc and session_doc.get('ekyc'):
                 try:
                     ekyc_str = json.dumps(session_doc.get('ekyc'))
                 except Exception:
                     ekyc_str = str(session_doc.get('ekyc'))
                 parts.append(f"EKYC: {ekyc_str}\n")
-
-            # include prior messages in chronological order
+            # 3. Prior messages
             if session_doc and isinstance(session_doc.get('messages'), list):
                 for m in session_doc.get('messages'):
                     role = m.get('role', 'user')
-                    # messages content expected to be a list of objects with 'text'
                     content_parts = []
                     for c in m.get('content', []):
                         text = c.get('text') if isinstance(c, dict) else str(c)
@@ -1530,10 +1548,8 @@ def lambda_handler(event, context):
                             content_parts.append(str(text))
                     if content_parts:
                         parts.append(f"{role.upper()}: {' '.join(content_parts)}\n")
-
-            # finally append the current user's message
+            # 4. Current user message
             parts.append(f"USER: {message}\n")
-            # join into one prompt string
             prompt = "\n".join(parts)
 
         model_error = None
