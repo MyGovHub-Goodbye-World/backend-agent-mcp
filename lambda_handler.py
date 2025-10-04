@@ -689,7 +689,7 @@ def lambda_handler(event, context):
             # Generate new timestamp for assistant response (when we actually respond)
             assistant_timestamp = datetime.now(timezone.utc)
             assistant_timestamp_iso = assistant_timestamp.isoformat()
-            assistant_timestamp_z = assistant_timestamp.replace('+00:00', 'Z')
+            assistant_timestamp_z = assistant_timestamp_iso.replace('+00:00', 'Z')
             
             if response_text is not None:
                 assistant_msg_doc = {
