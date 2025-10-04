@@ -374,10 +374,9 @@ def _generate_document_analysis_prompt(ocr_result, user_message):
         else:
             prompt_parts.append("User uploaded a document without additional message.")
         prompt_parts.append("")
-        prompt_parts.append("IMPORTANT: After analyzing the document, ask the user to verify the extracted information is correct.")
-        prompt_parts.append("Include a clear message asking: 'Please review the extracted information above and confirm if it is accurate by replying with YES or CORRECT.'")
-        prompt_parts.append("")
-        prompt_parts.append("Only after user verification can you proceed with specific MyGovHub services.")
+        prompt_parts.append("IMPORTANT: Keep your response concise. Show ONLY the extracted key information in a simple format.")
+        prompt_parts.append("After showing the data, ask: 'Is this information correct? Please reply YES to confirm.'")
+        prompt_parts.append("Do not repeat the information multiple times or add lengthy explanations.")
         prompt_parts.append("")
         prompt_parts.append("NOTE: If you include a signature, use 'MyGovHub Support Team' only. Do not use placeholders like '[Your Name]' or similar.")
         
