@@ -446,6 +446,8 @@ def lambda_handler(event, context):
     # Validate required fields
     user_id = body.get('userId')
     message = body.get('message', '')  # Default to empty string if not provided
+    user_timestamp_z = body.get('createdAt')
+    user_timestamp_iso = user_timestamp_z.replace('Z', '+00:00')
     session_id = body.get('sessionId')
     ekyc = body.get('ekyc') or {}
     attachments = body.get('attachment', [])
@@ -668,7 +670,7 @@ def lambda_handler(event, context):
             user_msg_doc = {
                 'messageId': message_id,
                 'message': str(message),
-                'timestamp': created_at_iso,
+                'timestamp': user_timestamp_iso,
                 'type': 'user',
                 'role': 'user',
                 'content': [{'text': str(message)}]
@@ -684,12 +686,16 @@ def lambda_handler(event, context):
 
             # push the assistant message; if model failed, store an error message as assistant reply
             assistant_message_id = str(uuid.uuid4())
+            # Generate new timestamp for assistant response (when we actually respond)
+            assistant_timestamp = datetime.now(timezone.utc)
+            assistant_timestamp_iso = assistant_timestamp.isoformat()
+            assistant_timestamp_z = assistant_timestamp.replace('+00:00', 'Z')
             
             if response_text is not None:
                 assistant_msg_doc = {
                     'messageId': assistant_message_id,
                     'message': str(response_text),
-                    'timestamp': created_at_iso,
+                    'timestamp': assistant_timestamp_iso,
                     'type': 'assistant',
                     'role': 'assistant',
                     'content': [{'text': str(response_text)}]
@@ -698,7 +704,7 @@ def lambda_handler(event, context):
                 assistant_msg_doc = {
                     'messageId': assistant_message_id,
                     'message': 'ERROR: assistant failed to respond. See modelError in response.',
-                    'timestamp': created_at_iso,
+                    'timestamp': assistant_timestamp_iso,
                     'type': 'assistant',
                     'role': 'assistant',
                     'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}],
@@ -730,7 +736,7 @@ def lambda_handler(event, context):
             'data': {
                 'messageId': message_id,
                 'message': response_text if response_text is not None else 'ERROR: assistant failed to respond',
-                'createdAt': created_at_z,
+                'createdAt': assistant_timestamp_z,
                 'sessionId': session_to_update,
                 'attachment': body.get('attachment') or []
             }
