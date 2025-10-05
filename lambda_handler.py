@@ -299,7 +299,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
             user_coll = chats_db[user_id]
             current_session = user_coll.find_one({'sessionId': session_id})
             if current_session and current_session.get('context'):
-                workflow_state = current_session['context'].get('renewal_workflow_state')
+                workflow_state = current_session['context'].get(f'{service_name}_workflow_state')
             client_state.close()
         except Exception:
             pass
@@ -320,14 +320,14 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
         # Handle different workflow states
         if workflow_state == 'license_confirmed':
             # User confirmed, now ask for renewal duration using AI
-            # Set workflow state and return AI prompt instruction
+            # Set workflow state and return AI prompt instrucWWWtion
             try:
                 client_workflow = _connect_mongo()
                 chats_db = client_workflow['chats']
                 user_coll = chats_db[user_id]
                 user_coll.update_one(
                     {'sessionId': session_id}, 
-                    {'$set': {'context.renewal_workflow_state': 'asking_duration'}}
+                    {'$set': {f'context.{service_name}_workflow_state': 'asking_duration'}}
                 )
                 client_workflow.close()
             except Exception:
@@ -350,7 +350,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                 user_coll = chats_db[user_id]
                 user_coll.update_one(
                     {'sessionId': session_id}, 
-                    {'$set': {'context.renewal_workflow_state': 'license_shown'}}
+                    {'$set': {f'context.{service_name}_workflow_state': 'license_shown'}}
                 )
                 client_workflow.close()
             except Exception:
@@ -1382,7 +1382,7 @@ def lambda_handler(event, context):
             session_to_update = new_session_generated if new_session_generated else session_id
             user_coll.update_one(
                 {'sessionId': session_to_update}, 
-                {'$set': {'context.renewal_workflow_state': new_state}}
+                {'$set': {f'context.{active_service}_workflow_state': new_state}}
             )
             if _should_log():
                 logger.info('Updated service workflow state to: %s', new_state)
@@ -1570,7 +1570,7 @@ def lambda_handler(event, context):
             session_current = new_session_generated if new_session_generated else session_id
             current_session = user_coll.find_one({'sessionId': session_current})
             if current_session and current_session.get('context'):
-                current_workflow_state = current_session['context'].get('renewal_workflow_state')
+                current_workflow_state = current_session['context'].get(f'{active_service}_workflow_state')
             client_check_state.close()
         except Exception:
             pass
