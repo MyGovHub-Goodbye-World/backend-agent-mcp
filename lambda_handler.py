@@ -1368,6 +1368,15 @@ def lambda_handler(event, context):
         # Multi-word accept if all tokens in affirmative set
         if all(t in aff_tokens for t in cleaned.replace('!', '').split()):
             return True
+        
+        # For unclear cases, use AI as backup (only for longer messages that might be affirmative)
+        if len(cleaned) > 15 and len(cleaned) < 50:
+            ai_intent = _detect_intent_with_ai(msg)
+            if ai_intent == 'affirmative':
+                if _should_log():
+                    logger.info('AI detected affirmative intent: %s', msg)
+                return True
+                
         return False
 
     def _is_negative(msg: str) -> bool:
@@ -1391,6 +1400,14 @@ def lambda_handler(event, context):
         # Multi-word negative phrases
         if any(phrase in cleaned for phrase in ['not interested', 'no thanks', 'no thank you', 'tak mahu', 'tak nak']):
             return True
+        
+        # For unclear cases, use AI as backup
+        if len(cleaned) > 10 and len(cleaned) < 50:
+            ai_intent = _detect_intent_with_ai(msg)
+            if ai_intent == 'negative':
+                if _should_log():
+                    logger.info('AI detected negative intent: %s', msg)
+                return True
             
         return False
 
@@ -1409,6 +1426,97 @@ def lambda_handler(event, context):
         # Check for phrases that indicate incorrectness
         rejection_phrases = ['not correct', 'not accurate', 'not right', 'tidak betul', 'tidak tepat']
         if any(phrase in cleaned for phrase in rejection_phrases):
+            return True
+        
+        # For unclear cases, use AI as backup
+        if len(cleaned) > 5 and len(cleaned) < 50:
+            ai_intent = _detect_intent_with_ai(msg)
+            if ai_intent == 'document_rejection':
+                if _should_log():
+                    logger.info('AI detected document rejection intent: %s', msg)
+                return True
+            
+        return False
+
+    def _detect_intent_with_ai(msg: str) -> str:
+        """Use AI to detect user intent from their message"""
+        try:
+            intent_prompt = (
+                "SYSTEM: You are an intent classifier for a government services chatbot. "
+                "Analyze the user's message and determine their intent. "
+                "Respond with ONLY ONE of these intent labels (nothing else):\n\n"
+                "- SESSION_TERMINATION: User wants to end/exit/quit the conversation completely\n"
+                "- SERVICE_CONTINUE: User wants to continue with current service or process\n"
+                "- DOCUMENT_REJECTION: User says document information is wrong/incorrect\n"
+                "- AFFIRMATIVE: User agrees/confirms (yes, ok, correct, etc.)\n"
+                "- NEGATIVE: User disagrees/declines (no, not interested, etc.)\n"
+                "- GENERAL_INQUIRY: General questions or requests for help\n"
+                "- UNCLEAR: Message is ambiguous or unclear\n\n"
+                "SESSION_TERMINATION examples:\n"
+                "- 'I want to quit', 'exit', 'I'm done', 'cancel this', 'log out'\n"
+                "- 'This is taking too long, I'll come back later'\n"
+                "- 'Forget it, I don't want to do this anymore'\n"
+                "- 'I'm frustrated with this process'\n"
+                "- 'Can we just end this conversation?'\n"
+                "- 'I'm not interested in continuing'\n\n"
+                f"User message: \"{msg}\"\n\n"
+                "Respond with the intent label only:"
+            )
+            
+            # Use existing run_agent function (which calls Bedrock)
+            ai_intent = run_agent(intent_prompt).strip().upper()
+            
+            # Validate AI response and return standard intent
+            if 'SESSION_TERMINATION' in ai_intent:
+                return 'session_termination'
+            elif 'AFFIRMATIVE' in ai_intent:
+                return 'affirmative'
+            elif 'NEGATIVE' in ai_intent:
+                return 'negative'
+            elif 'DOCUMENT_REJECTION' in ai_intent:
+                return 'document_rejection'
+            else:
+                return 'unclear'
+                
+        except Exception as e:
+            if _should_log():
+                logger.error('AI intent detection failed: %s', str(e))
+            return 'unclear'
+
+    def _is_session_termination_request(msg: str) -> bool:
+        # First try AI-powered detection for more intelligent recognition
+        ai_intent = _detect_intent_with_ai(msg)
+        if ai_intent == 'session_termination':
+            if _should_log():
+                logger.info('AI detected session termination intent: %s', msg)
+            return True
+        
+        # Fallback to keyword-based detection for reliability
+        termination_tokens = {
+            'exit', 'quit', 'end', 'stop', 'cancel', 'bye', 'goodbye', 'close',
+            'terminate', 'finish', 'done', 'logout', 'log out', 'sign out', 'reset',
+            'keluar', 'berhenti', 'tamat', 'selesai', 'tutup', 'habis', 'ulang'
+        }
+        cleaned = msg.strip().lower()
+        
+        # Direct match for termination terms
+        if cleaned in termination_tokens:
+            if _should_log():
+                logger.info('Keyword detected session termination: %s', msg)
+            return True
+        
+        # Check for phrases that start with termination words
+        for term_word in ['exit', 'quit', 'end', 'stop', 'cancel', 'close', 'reset', 'keluar', 'berhenti', 'tamat']:
+            if cleaned.startswith(f'{term_word} ') or cleaned == term_word:
+                if _should_log():
+                    logger.info('Keyword phrase detected session termination: %s', msg)
+                return True
+        
+        # Multi-word termination phrases
+        termination_phrases = ['log out', 'sign out', 'end session', 'close session', 'reset session', 'restart session', 'i want to exit', 'i want to quit', 'i want to reset']
+        if any(phrase in cleaned for phrase in termination_phrases):
+            if _should_log():
+                logger.info('Multi-word phrase detected session termination: %s', msg)
             return True
             
         return False
@@ -1433,6 +1541,35 @@ def lambda_handler(event, context):
         except Exception as e:
             if _should_log():
                 logger.error('Failed to update workflow state: %s', str(e))
+    
+    # Check for session termination request (highest priority - checked before all other logic)
+    if _is_session_termination_request(message) and not attachments:
+        # User wants to end the session completely
+        try:
+            client_terminate = _connect_mongo()
+            chats_db = client_terminate['chats']
+            user_coll = chats_db[user_id]
+            session_current = new_session_generated if new_session_generated else session_id
+            
+            # Set session status to cancelled and clear any active service
+            user_coll.update_one(
+                {'sessionId': session_current}, 
+                {'$set': {
+                    'status': 'cancelled',
+                    'service': ''  # Clear active service
+                }}
+            )
+            
+            # Set intent type to force connection end
+            intent_type = 'force_end_connection'
+            
+            if _should_log():
+                logger.info('User requested session termination, marked session as cancelled')
+            
+            client_terminate.close()
+        except Exception as e:
+            if _should_log():
+                logger.error('Failed to terminate session: %s', str(e))
     
     # Order: explicit rejection -> corrections -> affirmation
     # Rejection (needs corrections)
