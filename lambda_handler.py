@@ -1369,6 +1369,49 @@ def lambda_handler(event, context):
         if all(t in aff_tokens for t in cleaned.replace('!', '').split()):
             return True
         return False
+
+    def _is_negative(msg: str) -> bool:
+        # Accept negative responses - both English and Malay
+        neg_tokens = {
+            'no', 'nope', 'nah', 'not', 'cancel', 'cancelled', 'stop', 'quit', 'exit',
+            'not interested', 'no thanks', 'no thank you', 'decline', 'reject',
+            'tidak', 'tak', 'tak mahu', 'tak nak', 'batal', 'batalkan'
+        }
+        cleaned = msg.strip().lower()
+        
+        # Direct match for single words or common phrases
+        if cleaned in neg_tokens:
+            return True
+        
+        # Check for phrases that start with negative words
+        for neg_word in ['no', 'not', 'cancel', 'stop', 'tidak', 'tak', 'batal']:
+            if cleaned.startswith(f'{neg_word} ') or cleaned == neg_word:
+                return True
+        
+        # Multi-word negative phrases
+        if any(phrase in cleaned for phrase in ['not interested', 'no thanks', 'no thank you', 'tak mahu', 'tak nak']):
+            return True
+            
+        return False
+
+    def _is_document_rejection(msg: str) -> bool:
+        # Accept document-specific rejection responses - includes accuracy/correctness terms
+        rejection_tokens = {
+            'no', 'incorrect', 'wrong', 'not correct', 'not accurate', 'inaccurate',
+            'false', 'mistake', 'error', 'invalid', 'salah', 'tidak betul', 'tidak tepat'
+        }
+        cleaned = msg.strip().lower()
+        
+        # Direct match for rejection terms
+        if cleaned in rejection_tokens:
+            return True
+        
+        # Check for phrases that indicate incorrectness
+        rejection_phrases = ['not correct', 'not accurate', 'not right', 'tidak betul', 'tidak tepat']
+        if any(phrase in cleaned for phrase in rejection_phrases):
+            return True
+            
+        return False
     
     # Handle service workflow state transitions
     def _update_service_workflow_state(new_state: str):
@@ -1393,7 +1436,7 @@ def lambda_handler(event, context):
     
     # Order: explicit rejection -> corrections -> affirmation
     # Rejection (needs corrections)
-    if unverified_doc_key and message_lower in ['no', 'incorrect', 'wrong', 'not correct', 'not accurate']:
+    if unverified_doc_key and _is_document_rejection(message):
         intent_type = 'document_correction_needed'
         verification_status = 'rejected'
         # Set status to correcting
@@ -1424,7 +1467,7 @@ def lambda_handler(event, context):
             intent_type = 'document_verified'
             verification_status = 'confirmed'
     # Legacy path (affirmation first) kept for cases without document
-    elif any(keyword in message_lower for keyword in ['yes']) and not any(negative in message_lower for negative in ['no', 'not', 'wrong', 'incorrect']):
+    elif _is_affirmative(message) and not _is_document_rejection(message):
         if unverified_doc_key:
             intent_type = 'document_verified'
             verification_status = 'confirmed'
@@ -1580,6 +1623,50 @@ def lambda_handler(event, context):
             _update_service_workflow_state('license_confirmed')
             if _should_log():
                 logger.info('User confirmed license renewal, updated workflow state')
+    
+    # Check for service-specific cancellation (when service is active and user says no)
+    elif active_service == 'renew_license' and _is_negative(message_lower) and not unverified_doc_key:
+        # Check current workflow state
+        current_workflow_state = None
+        try:
+            client_check_state = _connect_mongo()
+            chats_db = client_check_state['chats']
+            user_coll = chats_db[user_id]
+            session_current = new_session_generated if new_session_generated else session_id
+            current_session = user_coll.find_one({'sessionId': session_current})
+            if current_session and current_session.get('context'):
+                current_workflow_state = current_session['context'].get(f'{active_service}_workflow_state')
+            client_check_state.close()
+        except Exception:
+            pass
+        
+        if current_workflow_state == 'license_shown':
+            # User declined license renewal, cancel the service
+            try:
+                client_cancel = _connect_mongo()
+                chats_db = client_cancel['chats']
+                user_coll = chats_db[user_id]
+                session_current = new_session_generated if new_session_generated else session_id
+                
+                # Set workflow state to cancelled and session status to cancelled
+                user_coll.update_one(
+                    {'sessionId': session_current}, 
+                    {'$set': {
+                        f'context.{active_service}_workflow_state': 'action_cancelled',
+                        'status': 'cancelled'
+                    }}
+                )
+                
+                # Set intent type to force connection end
+                intent_type = 'force_end_connection'
+                
+                if _should_log():
+                    logger.info('User declined license renewal, marked session as cancelled')
+                
+                client_cancel.close()
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to cancel service workflow: %s', str(e))
 
     service_ready = False
     if active_service:
@@ -1713,7 +1800,7 @@ def lambda_handler(event, context):
     try:
         # If a service is active and requirements are met, bypass model with deterministic next-step prompt
         if active_service and service_ready and intent_type not in (
-            'document_processing', 'document_correction_needed', 'document_correction_provided'
+            'document_processing', 'document_correction_needed', 'document_correction_provided', 'force_end_connection'
         ):
             # Get service message (may be direct message or AI prompt)
             service_message = _build_service_next_step_message(active_service, user_id, session_id, session_doc)
@@ -1885,6 +1972,15 @@ def lambda_handler(event, context):
                     "To process your bill payment, I need to verify your account details and bill information. Please upload:\n\n"
                     "📸 TNB Bill Document: Take a photo of your TNB bill (the upper portion showing your account number and amount due)\n\n"
                     "Please ensure the photo is clear and all important details are visible. I'll extract the account information to help you with the payment process."
+                )
+            elif intent_type == 'force_end_connection':
+                # User declined service, end the session and force restart
+                prompt = (
+                    "SYSTEM: Respond ONLY with the following message (no extra sentences).\n\n"
+                    "USER-FACING MESSAGE:\n"
+                    "No problem! You can always return later if you change your mind. "
+                    "Thank you for using MyGovHub services. Have a great day!\n\n"
+                    "MyGovHub Support Team"
                 )
             else:
                 # Generic context-building order: 1) Document context summary 2) EKYC 3) Prior messages 4) Current user message
@@ -2063,7 +2159,7 @@ def lambda_handler(event, context):
                 'messageId': message_id,
                 'message': response_text if response_text is not None else 'ERROR: assistant failed to respond',
                 'createdAt': assistant_timestamp_z,
-                'sessionId': session_to_update,
+                'sessionId': '(new-session)' if intent_type == 'force_end_connection' else session_to_update,
                 'attachment': body.get('attachment') or []
             }
         }
@@ -2072,6 +2168,8 @@ def lambda_handler(event, context):
             resp_body['data']['intent_type'] = intent_type
             if _should_log():
                 logger.info('Final response includes intent_type: %s', intent_type)
+                if intent_type == 'force_end_connection':
+                    logger.info('Force end connection - returning (new-session) to restart conversation')
 
         if model_error:
             resp_body['data']['modelError'] = model_error
