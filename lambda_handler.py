@@ -1601,22 +1601,21 @@ def lambda_handler(event, context):
             session_current_id = new_session_generated if new_session_generated else session_id
             current_session = coll_check.find_one({'sessionId': session_current_id})
             
-            # Check if any previous assistant messages contain service_*_next intent
-            has_service_next_message = False
-            if current_session and current_session.get('messages'):
-                for msg in current_session.get('messages', []):
-                    if (msg.get('role') == 'assistant' and 
-                        msg.get('intent', '').startswith(f'service_{active_service}_next')):
-                        has_service_next_message = True
-                        break
+            # Check if messages have been cleared for this service already using a flag
+            messages_already_cleared = False
+            if current_session and current_session.get('context'):
+                messages_already_cleared = current_session['context'].get(f'{active_service}_messages_cleared', False)
             
-            # If no previous service_next message found, this is the first time service is ready
-            if not has_service_next_message:
+            # If messages haven't been cleared yet for this service, this is the first time service is ready
+            if not messages_already_cleared:
                 service_just_became_ready = True
                 # Clear all messages when service becomes ready for the first time
                 coll_check.update_one(
                     {'sessionId': session_current_id}, 
-                    {'$set': {'messages': []}}
+                    {'$set': {
+                        'messages': [],
+                        f'context.{active_service}_messages_cleared': True
+                    }}
                 )
                 if _should_log():
                     logger.info('Cleared all messages as service %s is now ready for first time', active_service)
