@@ -27,6 +27,21 @@ _bedrock_client = boto3.client(
 _model_id = os.getenv("BEDROCK_MODEL_ID") or "amazon.nova-lite-v1:0"
 
 
+def _normalize_ic(value: str) -> str:
+    """Normalize Malaysian IC / identity numbers for comparison.
+
+    Removes all non-alphanumeric characters, uppercases the string and returns only
+    the digits/letters sequence. Safe for None or empty inputs (returns empty string).
+    Example: '041223-07-0745' -> '041223070745'
+    """
+    if not value:
+        return ""
+    import re
+    # Keep digits and letters only (primarily digits for IC) and uppercase.
+    cleaned = re.sub(r"[^0-9A-Za-z]", "", str(value))
+    return cleaned.upper()
+
+
 def run_agent(
     prompt: str,
     max_tokens: int = int(os.getenv("BEDROCK_MAX_TOKENS", 512)),
@@ -1530,6 +1545,46 @@ def lambda_handler(event, context):
                     return _cors_response(200, resp_body)
                 
                 # Document is clear, set intent type and save context to session
+                # Security check: if this is an ID card / identification document, ensure
+                # the extracted IC/userId matches the authenticated user_id. If mismatch,
+                # do NOT persist the document context.
+                try:
+                    category_detection = ocr_result.get('category_detection', {}) or {}
+                    detected_category = (category_detection.get('detected_category') or '').lower()
+                    extracted_data = ocr_result.get('extracted_data', {}) or {}
+                    extracted_ic = extracted_data.get('userId') or extracted_data.get('ic_number') or extracted_data.get('ic')
+                    if detected_category in ('identification', 'idcard', 'id_card', 'identity', 'identity_card') and extracted_ic:
+                        norm_uploaded = _normalize_ic(extracted_ic)
+                        norm_user = _normalize_ic(user_id)
+                        if norm_uploaded and norm_user and norm_uploaded != norm_user:
+                            if _should_log():
+                                logger.info('Identity mismatch detected: uploaded_ic=%s user_id=%s', norm_uploaded, norm_user)
+                            # Craft a user-safe masked representation of uploaded IC to avoid leaking full value.
+                            masked_uploaded = norm_uploaded
+                            if len(masked_uploaded) >= 12:
+                                masked_uploaded = masked_uploaded[:4] + '******' + masked_uploaded[-2:]
+                            mismatch_message = (
+                                "The identity number on the uploaded ID card (" + masked_uploaded + ") "
+                                "does not match the account you are logged in with. For security reasons I cannot "
+                                "process this document. Please upload the correct ID card that belongs to you, or "
+                                "log in with the matching account." 
+                            )
+                            resp_body = {
+                                'status': {'statusCode': 200, 'message': 'Success'},
+                                'data': {
+                                    'messageId': message_id,
+                                    'message': mismatch_message,
+                                    'createdAt': created_at_z,
+                                    'sessionId': session_id if session_id != '(new-session)' else new_session_generated,
+                                    'attachment': attachments,
+                                    'intent_type': 'identity_mismatch'
+                                }
+                            }
+                            return _cors_response(200, resp_body)
+                except Exception as sec_e:
+                    if _should_log():
+                        logger.error('Failed during identity mismatch check: %s', str(sec_e))
+
                 intent_type = 'document_processing'
                 session_to_save = new_session_generated if new_session_generated else session_id
                 _save_document_context_to_session(user_id, session_to_save, ocr_result, attachment['name'])
