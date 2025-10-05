@@ -291,6 +291,19 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                 logger.exception('License retrieval/update failure: %s', str(e))
             return "Identity verified, but I couldn't retrieve your license record right now. Please try again shortly or provide more details."
 
+        # Check current workflow state from session
+        workflow_state = None
+        try:
+            client_state = _connect_mongo()
+            chats_db = client_state['chats']
+            user_coll = chats_db[user_id]
+            current_session = user_coll.find_one({'sessionId': session_id})
+            if current_session and current_session.get('context'):
+                workflow_state = current_session['context'].get('renewal_workflow_state')
+            client_state.close()
+        except Exception:
+            pass
+        
         # Use record_for_context for message composition
         status = (record_for_context or {}).get('status')
         valid_from = (record_for_context or {}).get('valid_from')
@@ -304,13 +317,52 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                 "Please visit the nearest JPJ Malaysia branch to resolve the suspension before renewal.".format(ln=license_number or 'N/A')
             )
 
-        return (
-            f"We found your driving license record:\n\n"
-            f"License No: {license_number or 'N/A'}\n"
-            f"Valid from: {valid_from or 'N/A'} to {valid_to or 'N/A'}\n"
-            f"Status: {status.upper() if status else 'N/A'}\n\n"
-            "I can help extend your license validity. Are you sure you want to proceed with renewal?"
-        )
+        # Handle different workflow states
+        if workflow_state == 'license_confirmed':
+            # User confirmed, now ask for renewal duration using AI
+            # Set workflow state and return AI prompt instruction
+            try:
+                client_workflow = _connect_mongo()
+                chats_db = client_workflow['chats']
+                user_coll = chats_db[user_id]
+                user_coll.update_one(
+                    {'sessionId': session_id}, 
+                    {'$set': {'context.renewal_workflow_state': 'asking_duration'}}
+                )
+                client_workflow.close()
+            except Exception:
+                pass
+            
+            # Return prompt for AI to generate duration options
+            return (
+                "SYSTEM: Generate a license renewal duration selection prompt titled 'License Renewal Duration'. "
+                f"Current license expires: {valid_to or 'N/A'}. "
+                "Create a friendly message asking how many years to extend (1-10 years). "
+                "Include pricing: RM 30.00 per year. Show options 1-10 with calculated prices in 2 decimals. "
+                "Use emojis and clear formatting. Ask user to reply with number of years."
+            )
+        else:
+            # First time or default - show license info and ask for confirmation
+            # Set workflow state to track that we've shown license info
+            try:
+                client_workflow = _connect_mongo()
+                chats_db = client_workflow['chats']
+                user_coll = chats_db[user_id]
+                user_coll.update_one(
+                    {'sessionId': session_id}, 
+                    {'$set': {'context.renewal_workflow_state': 'license_shown'}}
+                )
+                client_workflow.close()
+            except Exception:
+                pass
+            
+            return (
+                f"We found your driving license record:\n\n"
+                f"License No: {license_number or 'N/A'}\n"
+                f"Valid from: {valid_from or 'N/A'} to {valid_to or 'N/A'}\n"
+                f"Status: {status.upper() if status else 'N/A'}\n\n"
+                "I can help extend your license validity. Are you sure you want to proceed with renewal?"
+            )
 
     if service_name == 'pay_tnb_bill':
         return (
@@ -1317,7 +1369,28 @@ def lambda_handler(event, context):
         if all(t in aff_tokens for t in cleaned.replace('!', '').split()):
             return True
         return False
-
+    
+    # Handle service workflow state transitions
+    def _update_service_workflow_state(new_state: str):
+        """Update the service workflow state in session context"""
+        if not active_service:
+            return
+        try:
+            client_workflow = _connect_mongo()
+            chats_db = client_workflow['chats']
+            user_coll = chats_db[user_id]
+            session_to_update = new_session_generated if new_session_generated else session_id
+            user_coll.update_one(
+                {'sessionId': session_to_update}, 
+                {'$set': {'context.renewal_workflow_state': new_state}}
+            )
+            if _should_log():
+                logger.info('Updated service workflow state to: %s', new_state)
+            client_workflow.close()
+        except Exception as e:
+            if _should_log():
+                logger.error('Failed to update workflow state: %s', str(e))
+    
     # Order: explicit rejection -> corrections -> affirmation
     # Rejection (needs corrections)
     if unverified_doc_key and message_lower in ['no', 'incorrect', 'wrong', 'not correct', 'not accurate']:
@@ -1486,6 +1559,28 @@ def lambda_handler(event, context):
     if session_doc:
         active_service = session_doc.get('service') or None
 
+    # Check for service-specific confirmations (when service is active and user says yes)
+    if active_service == 'renew_license' and _is_affirmative(message_lower) and not unverified_doc_key:
+        # Check current workflow state
+        current_workflow_state = None
+        try:
+            client_check_state = _connect_mongo()
+            chats_db = client_check_state['chats']
+            user_coll = chats_db[user_id]
+            session_current = new_session_generated if new_session_generated else session_id
+            current_session = user_coll.find_one({'sessionId': session_current})
+            if current_session and current_session.get('context'):
+                current_workflow_state = current_session['context'].get('renewal_workflow_state')
+            client_check_state.close()
+        except Exception:
+            pass
+        
+        if current_workflow_state == 'license_shown':
+            # User confirmed license renewal, update state
+            _update_service_workflow_state('license_confirmed')
+            if _should_log():
+                logger.info('User confirmed license renewal, updated workflow state')
+
     service_ready = False
     if active_service:
         service_ready = _service_requirements_met(active_service, session_doc)
@@ -1621,16 +1716,28 @@ def lambda_handler(event, context):
         if active_service and service_ready and intent_type not in (
             'document_processing', 'document_correction_needed', 'document_correction_provided'
         ):
-            # Get direct service message instead of using AI model
-            response_text = _build_service_next_step_message(active_service, user_id, session_id, session_doc)
+            # Get service message (may be direct message or AI prompt)
+            service_message = _build_service_next_step_message(active_service, user_id, session_id, session_doc)
+            
             # Only force intent_type for service next step if not already set or if service just became ready
             if not intent_type or intent_type == 'document_verified' or service_just_became_ready:
                 intent_type = f'service_{active_service}_next'
-            if _should_log():
-                logger.info('Using direct service message. Intent type: %s, Verification status: %s, Service just ready: %s', 
-                           intent_type or 'None', verification_status or 'None', service_just_became_ready)
-            # Skip AI model call for deterministic service messages
-            model_error = None
+            
+            # Check if this is a direct message or AI prompt instruction
+            if service_message.startswith('SYSTEM:'):
+                # This is an AI prompt - use it as prompt for model
+                prompt = service_message
+                if _should_log():
+                    logger.info('Using AI-generated service prompt. Intent type: %s, Verification status: %s, Service just ready: %s', 
+                               intent_type or 'None', verification_status or 'None', service_just_became_ready)
+            else:
+                # This is a direct message - skip AI model
+                response_text = service_message
+                if _should_log():
+                    logger.info('Using direct service message. Intent type: %s, Verification status: %s, Service just ready: %s', 
+                               intent_type or 'None', verification_status or 'None', service_just_became_ready)
+                # Skip AI model call for deterministic service messages
+                model_error = None
             
         else:
             if _should_log():
