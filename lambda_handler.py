@@ -1888,7 +1888,6 @@ def lambda_handler(event, context):
             # push the user message (always)
             user_msg_doc = {
                 'messageId': message_id,
-                'message': str(message),
                 'timestamp': user_timestamp_iso,
                 'role': 'user',
                 'content': [{'text': str(message)}]
@@ -1919,7 +1918,6 @@ def lambda_handler(event, context):
             if response_text is not None:
                 assistant_msg_doc = {
                     'messageId': assistant_message_id,
-                    'message': str(response_text),
                     'timestamp': assistant_timestamp_iso,
                     'role': 'assistant',
                     'content': [{'text': str(response_text)}]
@@ -1927,7 +1925,6 @@ def lambda_handler(event, context):
             else:
                 assistant_msg_doc = {
                     'messageId': assistant_message_id,
-                    'message': 'ERROR: assistant failed to respond. See modelError in response.',
                     'timestamp': assistant_timestamp_iso,
                     'role': 'assistant',
                     'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}],
