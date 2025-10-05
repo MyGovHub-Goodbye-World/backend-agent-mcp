@@ -1459,15 +1459,20 @@ def lambda_handler(event, context):
     # --------------------------------------------------------------
     service_intent = None
     AVAILABLE_SERVICE_INTENTS = ['renew_license', 'pay_tnb_bill']
+    
+    # Determine active service (persisted) irrespective of current message intent
+    active_service = None
+
     if not intent_type and attachments == []:  # pure text request
         service_intent = _detect_service_intent(message_lower)
-        if service_intent == 'renew_license':
+        # Only set intent_type for NEW service requests, not when service is already active
+        if service_intent == 'renew_license' and not active_service:
             intent_type = 'renew_license'
-        elif service_intent == 'pay_tnb_bill':
+        elif service_intent == 'pay_tnb_bill' and not active_service:
             intent_type = 'pay_tnb_bill'
 
-    # If we have a service intent, update session 'service' field (v1: no legacy topic handling)
-    if service_intent in AVAILABLE_SERVICE_INTENTS:
+    # If we have a NEW service intent (not already active), update session 'service' field
+    if service_intent in AVAILABLE_SERVICE_INTENTS and not active_service:
         try:
             client_service = _connect_mongo()
             db_service = client_service['chats']
@@ -1498,8 +1503,6 @@ def lambda_handler(event, context):
             except Exception:
                 pass
 
-    # Determine active service (persisted) irrespective of current message intent
-    active_service = None
     if session_doc:
         active_service = session_doc.get('service') or None
 
@@ -1512,6 +1515,45 @@ def lambda_handler(event, context):
             except Exception:
                 pass
 
+    # Check if service just became ready and clear messages if so
+    service_just_became_ready = False
+    if active_service and service_ready:
+        # Check if this is the first time service became ready by looking at message history
+        try:
+            client_check = _connect_mongo()
+            db_check = client_check['chats']
+            coll_check = db_check[user_id]
+            session_current_id = new_session_generated if new_session_generated else session_id
+            current_session = coll_check.find_one({'sessionId': session_current_id})
+            
+            # Check if any previous assistant messages contain service_*_next intent
+            has_service_next_message = False
+            if current_session and current_session.get('messages'):
+                for msg in current_session.get('messages', []):
+                    if (msg.get('role') == 'assistant' and 
+                        msg.get('intent', '').startswith(f'service_{active_service}_next')):
+                        has_service_next_message = True
+                        break
+            
+            # If no previous service_next message found, this is the first time service is ready
+            if not has_service_next_message:
+                service_just_became_ready = True
+                # Clear all messages when service becomes ready for the first time
+                coll_check.update_one(
+                    {'sessionId': session_current_id}, 
+                    {'$set': {'messages': []}}
+                )
+                if _should_log():
+                    logger.info('Cleared all messages as service %s is now ready for first time', active_service)
+                    
+        except Exception as e:
+            if _should_log():
+                logger.error('Failed to check/clear messages for service readiness: %s', str(e))
+        finally:
+            try:
+                client_check.close()
+            except Exception:
+                pass
 
     if attachments:
         # Process the first attachment (image document)
@@ -1600,11 +1642,12 @@ def lambda_handler(event, context):
             'document_processing', 'document_correction_needed', 'document_correction_provided'
         ):
             prompt = _build_service_next_step_message(active_service, user_id, session_id, session_doc)
-            # Force intent_type to service action stage indicator (optional)
-            if not intent_type or intent_type == 'document_verified':
+            # Only force intent_type for service next step if not already set or if service just became ready
+            if not intent_type or intent_type == 'document_verified' or service_just_became_ready:
                 intent_type = f'service_{active_service}_next'
             if _should_log():
-                logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
+                logger.info('Generating prompt. Intent type: %s, Verification status: %s, Service just ready: %s', 
+                           intent_type or 'None', verification_status or 'None', service_just_became_ready)
             
         else:
             if _should_log():
