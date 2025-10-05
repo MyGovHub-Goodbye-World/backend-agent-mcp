@@ -251,11 +251,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
         db_name = os.getenv('ATLAS_DB_NAME') or ''
         if not db_name:
             logger.error("License verification complete, but database name not configured. Please set ATLAS_DB_NAME environment variable.")
-            return (
-                "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-                "USER-FACING MESSAGE:\n"
-                "Identity verified, but I couldn't retrieve your license record right now. Please try again shortly or provide more details."
-            )
+            return "Identity verified, but I couldn't retrieve your license record right now. Please try again shortly or provide more details."
         license_record = None
         record_for_context = None
         try:
@@ -268,8 +264,6 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     logger.info('License lookup userId=%s found=%s', user_id, bool(license_record))
                 if not license_record:
                     return (
-                        "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-                        "USER-FACING MESSAGE:\n"
                         "Identity verified, but I didn't find an existing driving license record for your IC. "
                         "Please visit the nearest JPJ Malaysia branch to apply for a new license."
                     )
@@ -295,11 +289,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
         except Exception as e:
             if _should_log():
                 logger.exception('License retrieval/update failure: %s', str(e))
-            return (
-                "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-                "USER-FACING MESSAGE:\n"
-                "Identity verified, but I couldn't retrieve your license record right now. Please try again shortly or provide more details."
-            )
+            return "Identity verified, but I couldn't retrieve your license record right now. Please try again shortly or provide more details."
 
         # Use record_for_context for message composition
         status = (record_for_context or {}).get('status')
@@ -309,35 +299,25 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
 
         if status == 'suspended':
             return (
-                "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-                "USER-FACING MESSAGE:\n"
                 "We located your driving license record (License No: {ln}). Current status: SUSPENDED. "
                 "Suspended licenses must be handled at a physical branch for investigation or reinstatement. "
                 "Please visit the nearest JPJ Malaysia branch to resolve the suspension before renewal.".format(ln=license_number or 'N/A')
             )
 
         return (
-            "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-            "USER-FACING MESSAGE:\n"
-            "We found your driving license record:\n\n"
-            f"License No: {license_number or 'N/A'}).\n"
-            f"Valid from: {valid_from or 'N/A'} to {valid_to or 'N/A'}.\n"
-            f"Status: {status.upper()}.\n\n"
+            f"We found your driving license record:\n\n"
+            f"License No: {license_number or 'N/A'}\n"
+            f"Valid from: {valid_from or 'N/A'} to {valid_to or 'N/A'}\n"
+            f"Status: {status.upper() if status else 'N/A'}\n\n"
             "I can help extend your license validity. Are you sure you want to proceed with renewal?"
         )
 
     if service_name == 'pay_tnb_bill':
         return (
-            "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-            "USER-FACING MESSAGE:\n"
             "Bill details verified (account + invoice number). "
             "@TODO: Retrieve latest bill amount from MongoDB or billing service and ask user to confirm payment amount."
         )
-    return (
-        "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-        "USER-FACING MESSAGE:\n"
-        "Service data verified. @TODO: implement next workflow steps."
-    )
+    return "Service data verified. @TODO: implement next workflow steps."
 
 def _detect_service_intent(message_lower: str):
     """Detect high-level service intents from a free-form user message.
@@ -1459,7 +1439,7 @@ def lambda_handler(event, context):
     # --------------------------------------------------------------
     service_intent = None
     AVAILABLE_SERVICE_INTENTS = ['renew_license', 'pay_tnb_bill']
-    
+
     # Determine active service (persisted) irrespective of current message intent
     active_service = None
 
@@ -1641,13 +1621,16 @@ def lambda_handler(event, context):
         if active_service and service_ready and intent_type not in (
             'document_processing', 'document_correction_needed', 'document_correction_provided'
         ):
-            prompt = _build_service_next_step_message(active_service, user_id, session_id, session_doc)
+            # Get direct service message instead of using AI model
+            response_text = _build_service_next_step_message(active_service, user_id, session_id, session_doc)
             # Only force intent_type for service next step if not already set or if service just became ready
             if not intent_type or intent_type == 'document_verified' or service_just_became_ready:
                 intent_type = f'service_{active_service}_next'
             if _should_log():
-                logger.info('Generating prompt. Intent type: %s, Verification status: %s, Service just ready: %s', 
+                logger.info('Using direct service message. Intent type: %s, Verification status: %s, Service just ready: %s', 
                            intent_type or 'None', verification_status or 'None', service_just_became_ready)
+            # Skip AI model call for deterministic service messages
+            model_error = None
             
         else:
             if _should_log():
@@ -1863,30 +1846,37 @@ def lambda_handler(event, context):
                     except Exception:
                         pass
 
-        model_error = None
-        response_text = None
-        try:
-            # Log full prompt (sanitized & truncated) for debugging if enabled
+        # Only call AI model if we don't already have a direct service response
+        if 'response_text' not in locals():
+            model_error = None
+            response_text = None
+            try:
+                # Log full prompt (sanitized & truncated) for debugging if enabled
+                if _should_log():
+                    try:
+                        _prompt_log = prompt
+                        # Basic masking for IC-like patterns (e.g., 6-2-4 digits or continuous 12 digits)
+                        import re as _re_mask
+                        _prompt_log = _re_mask.sub(r"******IC******", _re_mask.sub(r"(\d{6}-\d{2}-)\d{4}", r"\1****", _prompt_log))
+                        max_log_len = 3000
+                        truncated = len(_prompt_log) > max_log_len
+                        if truncated:
+                            _prompt_log_out = _prompt_log[:max_log_len] + '...<truncated>'
+                        else:
+                            _prompt_log_out = _prompt_log
+                        logger.info('Prompt full%s length=%d chars:\n%s', ' (truncated)' if truncated else '', len(prompt), _prompt_log_out)
+                    except Exception:
+                        pass
+                response_text = run_agent(prompt)
+            except Exception as model_exc:
+                # Record the model failure but continue — we'll persist an assistant error message
+                model_error = str(model_exc)
+                print('Model invocation failed:', model_error)
+        else:
+            # Direct service message - no AI model call needed
+            model_error = None  # No model error since we didn't call the model
             if _should_log():
-                try:
-                    _prompt_log = prompt
-                    # Basic masking for IC-like patterns (e.g., 6-2-4 digits or continuous 12 digits)
-                    import re as _re_mask
-                    _prompt_log = _re_mask.sub(r"******IC******", _re_mask.sub(r"(\d{6}-\d{2}-)\d{4}", r"\1****", _prompt_log))
-                    max_log_len = 3000
-                    truncated = len(_prompt_log) > max_log_len
-                    if truncated:
-                        _prompt_log_out = _prompt_log[:max_log_len] + '...<truncated>'
-                    else:
-                        _prompt_log_out = _prompt_log
-                    logger.info('Prompt full%s length=%d chars:\n%s', ' (truncated)' if truncated else '', len(prompt), _prompt_log_out)
-                except Exception:
-                    pass
-            response_text = run_agent(prompt)
-        except Exception as model_exc:
-            # Record the model failure but continue — we'll persist an assistant error message
-            model_error = str(model_exc)
-            print('Model invocation failed:', model_error)
+                logger.info('Using direct service response, skipping AI model call. Response length: %d chars', len(response_text or ''))
 
         # Persist the conversation: always push user message first, then assistant or error message
         session_to_update = new_session_generated if new_session_generated else session_id
