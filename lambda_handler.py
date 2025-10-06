@@ -6,6 +6,7 @@ import traceback
 import base64
 import requests
 
+
 import boto3
 from botocore.exceptions import ClientError
 import logging
@@ -363,11 +364,12 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     renew_fee = current_session['context'].get(f'{service_name}_renew_fee', 30.00)
                 
                 # Calculate new expiry date
-                from datetime import datetime, timedelta
                 try:
                     if valid_to:
                         current_expiry = datetime.strptime(valid_to, '%Y-%m-%d')
-                        new_expiry = current_expiry + timedelta(days=365 * duration_years)
+                        # Add years by replacing the year component
+                        new_year = current_expiry.year + duration_years
+                        new_expiry = current_expiry.replace(year=new_year)
                         new_expiry_str = new_expiry.strftime('%Y-%m-%d')
                     else:
                         new_expiry_str = 'N/A'
@@ -389,7 +391,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
             except Exception:
                 return "Error retrieving payment details. Please try again."
         elif workflow_state == 'license_payment_confirmed':
-            # Payment confirmed, show completion message
+            # Payment confirmed, update license record and show completion message
             try:
                 client_completion = _connect_mongo()
                 chats_db = client_completion['chats']
@@ -402,6 +404,75 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                 if current_session and current_session.get('context'):
                     duration_years = current_session['context'].get(f'{service_name}_duration_years', 1)
                     renew_fee = current_session['context'].get(f'{service_name}_renew_fee', 30.00)
+                
+                # Update the actual license record in MongoDB licenses collection
+                try:
+                    db_name = os.environ.get('ATLAS_DB_NAME') or ''
+                    if not db_name:
+                        logger.error("License verification complete, but database name not configured. Please set ATLAS_DB_NAME environment variable.")
+                        return "License renewal completed, but I couldn't update your license record right now. Please contact support if you don't see the renewal reflected in your account."
+                    
+                    licenses_coll = client_completion[db_name]['licenses']
+                    
+                    # Get current license data from session context
+                    license_data = current_session.get('context', {}).get('database_license', {})
+                    current_valid_to = license_data.get('valid_to')
+                    
+                    if current_valid_to:
+                        # Parse current expiry date and extend it
+                        try:
+                            # Parse the current valid_to date using datetime
+                            if isinstance(current_valid_to, str):
+                                # Try to parse common date formats
+                                try:
+                                    current_expiry = datetime.fromisoformat(current_valid_to.replace('Z', '+00:00'))
+                                except:
+                                    # Fallback for other formats
+                                    current_expiry = datetime.strptime(current_valid_to[:10], '%Y-%m-%d')
+                            else:
+                                current_expiry = current_valid_to
+                            
+                            # Calculate new expiry date (extend by duration_years from current expiry)
+                            # Add years by replacing the year component
+                            new_year = current_expiry.year + duration_years
+                            new_expiry = current_expiry.replace(year=new_year)
+                            
+                            # Update valid_from to today and valid_to to new expiry (use simple date format YYYY-MM-DD)
+                            renewal_date = datetime.now(timezone.utc)
+                            renewal_date_str = renewal_date.strftime('%Y-%m-%d')
+                            new_expiry_str = new_expiry.strftime('%Y-%m-%d')
+                            
+                            # Update the license document
+                            update_result = licenses_coll.update_one(
+                                {'userId': user_id},
+                                {'$set': {
+                                    'valid_from': renewal_date_str,
+                                    'valid_to': new_expiry_str,
+                                    'status': 'active',
+                                    'last_renewed': renewal_date,
+                                    'renewal_duration_years': duration_years,
+                                    'renewal_amount_paid': round(renew_fee, 2)
+                                }}
+                            )
+                            
+                            if update_result.modified_count > 0:
+                                if _should_log():
+                                    logger.info('Successfully updated license record for userId=%s: extended to %s', 
+                                                user_id, new_expiry.strftime('%Y-%m-%d'))
+                            else:
+                                if _should_log():
+                                    logger.warning('No license record updated for userId=%s', user_id)
+                                    
+                        except Exception as date_e:
+                            if _should_log():
+                                logger.error('Failed to parse/calculate license dates: %s', str(date_e))
+                    else:
+                        if _should_log():
+                            logger.warning('No valid_to date found in license data for userId=%s', user_id)
+                            
+                except Exception as license_e:
+                    if _should_log():
+                        logger.error('Failed to update license record: %s', str(license_e))
                 
                 # Set intent to redirect to confirming_end_connection after completion
                 try:
@@ -422,6 +493,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     f"**🎉 License Renewal Successful! 🎉**\n\n"
                     f"**Transaction Completed:**\n"
                     f"• License No: {license_number or 'N/A'}\n"
+                    f"• Validity Period: From {renewal_date_str} to {new_expiry_str}\n"
                     f"• Extension: {duration_years} year{'s' if duration_years > 1 else ''}\n"
                     f"• Amount Paid: RM {renew_fee:.2f}\n\n"
                     f"**Important:**\n"
