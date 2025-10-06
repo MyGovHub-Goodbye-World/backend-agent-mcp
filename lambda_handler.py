@@ -347,7 +347,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                 f"*Available: 1 to 10 years (RM 30.00 per year)*\n\n"
                 f"Please reply with the **number of years** you want (e.g., \"3\" for 3 years). 😊"
             )
-        elif workflow_state == 'confirming_payment_details':
+        elif workflow_state == 'confirming_license_payment_details':
             # User selected duration, now show payment confirmation
             try:
                 client_payment = _connect_mongo()
@@ -388,7 +388,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                 )
             except Exception:
                 return "Error retrieving payment details. Please try again."
-        elif workflow_state == 'payment_confirmed':
+        elif workflow_state == 'license_payment_confirmed':
             # Payment confirmed, show completion message
             try:
                 client_completion = _connect_mongo()
@@ -444,10 +444,186 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
             )
 
     if service_name == 'pay_tnb_bill':
-        return (
-            "Bill details verified (account + invoice number). "
-            "@TODO: Retrieve latest bill amount from MongoDB or billing service and ask user to confirm payment amount."
-        )
+        db_name = os.getenv('ATLAS_DB_NAME') or ''
+        if not db_name:
+            logger.error("Bill verification complete, but database name not configured. Please set ATLAS_DB_NAME environment variable.")
+            return "Bill details verified, but I couldn't retrieve your bill records right now. Please try again shortly or provide more details."
+        
+        # Get account number from verified document
+        account_number = None
+        if session_doc and session_doc.get('context'):
+            for key, doc_data in session_doc['context'].items():
+                if key.startswith('document_') and doc_data.get('isVerified') == 'verified':
+                    extracted_data = doc_data.get('extractedData', {})
+                    account_number = extracted_data.get('account_number')
+                    if account_number:
+                        break
+        
+        if not account_number:
+            return "I couldn't find a verified account number. Please upload your TNB bill document first."
+        
+        # Check current workflow state from session
+        workflow_state = None
+        try:
+            client_state = _connect_mongo()
+            chats_db = client_state['chats']
+            user_coll = chats_db[user_id]
+            current_session = user_coll.find_one({'sessionId': session_id})
+            if current_session and current_session.get('context'):
+                workflow_state = current_session['context'].get(f'{service_name}_workflow_state')
+            client_state.close()
+        except Exception:
+            pass
+        
+        # Fetch unpaid/overdue bills from MongoDB
+        bills_to_pay = []
+        try:
+            client = _connect_mongo()
+            try:
+                bills_coll = client[db_name]['tnb-bills']
+                # Find bills that need payment: unpaid or overdue (all bills must be paid in full)
+                bills_cursor = bills_coll.find({
+                    'bill.akaun.no_akaun': account_number,
+                    'status': {'$in': ['unpaid', 'overdue']}
+                }).sort('bill.meta.bil_semasa.tarikh_bil', -1)  # Latest bills first
+                
+                bills_to_pay = list(bills_cursor)
+                
+                if _should_log():
+                    logger.info('Found %d bills to pay for account %s', len(bills_to_pay), account_number)
+                
+                # Store bills in session context for later use
+                try:
+                    chats_db = client['chats']
+                    user_coll = chats_db[user_id]
+                    # Remove _id from bills before storing
+                    bills_for_context = [{k: v for k, v in bill.items() if k != '_id'} for bill in bills_to_pay]
+                    user_coll.update_one(
+                        {'sessionId': session_id}, 
+                        {'$set': {'context.database_bills': bills_for_context}}
+                    )
+                    if _should_log():
+                        logger.info('Stored %d bills in session context sessionId=%s', len(bills_for_context), session_id)
+                except Exception:
+                    if _should_log():
+                        logger.exception('Failed to persist bills into session context')
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            if _should_log():
+                logger.exception('Bills retrieval/update failure: %s', str(e))
+            return "Bill details verified, but I couldn't retrieve your bill records right now. Please try again shortly or provide more details."
+        
+        if not bills_to_pay:
+            return (
+                f"Great news! I checked your TNB account ({account_number}) and found no outstanding bills. "
+                "All your bills appear to be paid up to date. 🎉"
+            )
+        
+        # Handle different workflow states
+        if workflow_state == 'tnb_bills_confirmed':
+            # User confirmed payment, show completion message
+            try:
+                client_completion = _connect_mongo()
+                chats_db = client_completion['chats']
+                user_coll = chats_db[user_id]
+                current_session = user_coll.find_one({'sessionId': session_id})
+                
+                # Get total amount paid
+                total_paid = 0.0
+                bill_count = 0
+                if current_session and current_session.get('context'):
+                    total_paid = current_session['context'].get(f'{service_name}_total_amount', 0.0)
+                    bill_count = current_session['context'].get(f'{service_name}_bill_count', 0)
+                
+                client_completion.close()
+                
+                return (
+                    f"**🎉 TNB Bill Payment Successful! 🎉**\n\n"
+                    f"**Transaction Completed:**\n"
+                    f"• Account No: {account_number}\n"
+                    f"• Bills Paid: {bill_count}\n"
+                    f"• Total Amount: RM {total_paid:.2f}\n\n"
+                    f"**Important:**\n"
+                    f"• All outstanding bills have been paid\n"
+                    f"• You will receive a confirmation email shortly\n"
+                    f"• Please keep this transaction reference for your records\n\n"
+                    f"Thank you for using MyGovHub services! ⚡😊\n\n"
+                    f"MyGovHub Support Team"
+                )
+            except Exception:
+                return "TNB bill payment completed successfully! You will receive a confirmation email shortly."
+        else:
+            # First time or default - show bill info and ask for confirmation
+            # Set workflow state to track that we've shown bills info
+            try:
+                client_workflow = _connect_mongo()
+                chats_db = client_workflow['chats']
+                user_coll = chats_db[user_id]
+                user_coll.update_one(
+                    {'sessionId': session_id}, 
+                    {'$set': {f'context.{service_name}_workflow_state': 'tnb_bills_shown'}}
+                )
+                client_workflow.close()
+            except Exception:
+                pass
+            
+            # Calculate total amount and prepare bill summary
+            total_amount = 0.0
+            bill_summaries = []
+            
+            for bill in bills_to_pay:
+                bill_data = bill.get('bill', {})
+                akaun = bill_data.get('akaun', {})
+                meta = bill_data.get('meta', {})
+                bil_semasa = meta.get('bil_semasa', {})
+                
+                # All bills must be paid in full
+                amount_due = bil_semasa.get('jumlah', 0.0)
+                total_amount += amount_due
+                
+                # Format bill info
+                invoice_no = akaun.get('no_invois', 'N/A')
+                bill_date = bil_semasa.get('tarikh_bil', 'N/A')
+                due_date = bil_semasa.get('bayar_sebelum', 'N/A')
+                status_display = bill.get('status', 'unknown').upper()
+                
+                bill_summaries.append(
+                    f"• Invoice #{invoice_no} - {status_display}\n"
+                    f"  Bill Date: {bill_date} | Due: {due_date}\n"
+                    f"  Amount: RM {amount_due:.2f}"
+                )
+            
+            # Store payment details in session
+            try:
+                client_store = _connect_mongo()
+                chats_db = client_store['chats']
+                user_coll = chats_db[user_id]
+                user_coll.update_one(
+                    {'sessionId': session_id}, 
+                    {'$set': {
+                        f'context.{service_name}_total_amount': total_amount,
+                        f'context.{service_name}_bill_count': len(bills_to_pay)
+                    }}
+                )
+                client_store.close()
+            except Exception:
+                pass
+            
+            bills_text = "\n\n".join(bill_summaries)
+            
+            return (
+                f"**TNB Bill Payment ⚡**\n\n"
+                f"I found **{len(bills_to_pay)}** outstanding bill{'s' if len(bills_to_pay) > 1 else ''} for account **{account_number}**:\n\n"
+                f"{bills_text}\n\n"
+                f"**Total Amount Due: RM {total_amount:.2f}**\n\n"
+                f"Would you like to pay {'all these bills' if len(bills_to_pay) > 1 else 'this bill'} now? "
+                f"Reply **YES** to proceed with payment or **NO** to cancel."
+            )
+
     return "Service data verified. @TODO: implement next workflow steps."
 
 def _detect_service_intent(message_lower: str):
@@ -1843,9 +2019,9 @@ def lambda_handler(event, context):
             _update_service_workflow_state('license_confirmed')
             if _should_log():
                 logger.info('User confirmed license renewal, updated workflow state')
-        elif current_workflow_state == 'confirming_payment_details':
+        elif current_workflow_state == 'confirming_license_payment_details':
             # User confirmed payment, process the renewal
-            _update_service_workflow_state('payment_confirmed')
+            _update_service_workflow_state('license_payment_confirmed')
             intent_type = f'{active_service}_payment_confirmed'
             if _should_log():
                 logger.info('User confirmed license renewal payment, updated workflow state')
@@ -1893,7 +2069,7 @@ def lambda_handler(event, context):
             except Exception as e:
                 if _should_log():
                     logger.error('Failed to cancel service workflow: %s', str(e))
-        elif current_workflow_state == 'confirming_payment_details':
+        elif current_workflow_state == 'confirming_license_payment_details':
             # User declined payment, cancel the service
             try:
                 client_cancel = _connect_mongo()
@@ -1957,7 +2133,7 @@ def lambda_handler(event, context):
                         user_coll.update_one(
                             {'sessionId': session_current}, 
                             {'$set': {
-                                f'context.{active_service}_workflow_state': 'confirming_payment_details',
+                                f'context.{active_service}_workflow_state': 'confirming_license_payment_details',
                                 f'context.{active_service}_duration_years': years,
                                 f'context.{active_service}_renew_fee': round(renew_fee, 2)
                             }}
@@ -1976,6 +2152,73 @@ def lambda_handler(event, context):
                 else:
                     if _should_log():
                         logger.info('Invalid duration provided: %d (must be 1-10)', years)
+
+    # Check for TNB bill payment confirmations (when service is active and user says yes)
+    elif active_service == 'pay_tnb_bill' and _is_affirmative(message_lower) and not unverified_doc_key:
+        # Check current workflow state
+        current_workflow_state = None
+        try:
+            client_check_state = _connect_mongo()
+            chats_db = client_check_state['chats']
+            user_coll = chats_db[user_id]
+            session_current = new_session_generated if new_session_generated else session_id
+            current_session = user_coll.find_one({'sessionId': session_current})
+            if current_session and current_session.get('context'):
+                current_workflow_state = current_session['context'].get(f'{active_service}_workflow_state')
+            client_check_state.close()
+        except Exception:
+            pass
+        
+        if current_workflow_state == 'tnb_bills_shown':
+            # User confirmed TNB bill payment, update state
+            _update_service_workflow_state('tnb_bills_confirmed')
+            intent_type = f'{active_service}_payment_confirmed'
+            if _should_log():
+                logger.info('User confirmed TNB bill payment, updated workflow state')
+    
+    # Check for TNB bill payment cancellation (when service is active and user says no)
+    elif active_service == 'pay_tnb_bill' and _is_negative(message_lower) and not unverified_doc_key:
+        # Check current workflow state
+        current_workflow_state = None
+        try:
+            client_check_state = _connect_mongo()
+            chats_db = client_check_state['chats']
+            user_coll = chats_db[user_id]
+            session_current = new_session_generated if new_session_generated else session_id
+            current_session = user_coll.find_one({'sessionId': session_current})
+            if current_session and current_session.get('context'):
+                current_workflow_state = current_session['context'].get(f'{active_service}_workflow_state')
+            client_check_state.close()
+        except Exception:
+            pass
+        
+        if current_workflow_state == 'tnb_bills_shown':
+            # User declined TNB bill payment, cancel the service
+            try:
+                client_cancel = _connect_mongo()
+                chats_db = client_cancel['chats']
+                user_coll = chats_db[user_id]
+                session_current = new_session_generated if new_session_generated else session_id
+                
+                # Set workflow state to cancelled and session status to cancelled
+                user_coll.update_one(
+                    {'sessionId': session_current}, 
+                    {'$set': {
+                        f'context.{active_service}_workflow_state': 'action_cancelled',
+                        'status': 'cancelled'
+                    }}
+                )
+                
+                # Set intent type to force connection end
+                intent_type = 'force_end_connection'
+                
+                if _should_log():
+                    logger.info('User declined TNB bill payment, marked session as cancelled')
+                
+                client_cancel.close()
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to cancel TNB bill payment workflow: %s', str(e))
 
     service_ready = False
     if active_service:
