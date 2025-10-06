@@ -319,8 +319,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
 
         # Handle different workflow states
         if workflow_state == 'license_confirmed':
-            # User confirmed, now ask for renewal duration using AI
-            # Set workflow state and return AI prompt instrucWWWtion
+            # User confirmed, now ask for renewal duration with clean, concise options
             try:
                 client_workflow = _connect_mongo()
                 chats_db = client_workflow['chats']
@@ -332,15 +331,98 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                 client_workflow.close()
             except Exception:
                 pass
+
+            renew_fee_per_year = 30.00
             
-            # Return prompt for AI to generate duration options
+            # Return direct message with top 5 options (cleaner presentation)
             return (
-                "SYSTEM: Generate a license renewal duration selection prompt titled 'License Renewal Duration'. "
-                f"Current license expires: {valid_to or 'N/A'}. "
-                "Create a friendly message asking how many years to extend (1-10 years). "
-                "Include pricing: RM 30.00 per year. Show options 1-10 with calculated prices in 2 decimals. "
-                "Use emojis and clear formatting. Ask user to reply with number of years."
+                f"**License Renewal Duration 🔄**\n\n"
+                f"Your current license expires on **{valid_to or 'N/A'}**. Please select how many years you'd like to renew for:\n\n"
+                f"**Popular Options:**\n"
+                f"• **1 year** - RM {renew_fee_per_year:.2f}\n"
+                f"• **2 years** - RM {renew_fee_per_year * 2:.2f}\n"
+                f"• **3 years** - RM {renew_fee_per_year * 3:.2f}\n"
+                f"• **4 years** - RM {renew_fee_per_year * 4:.2f}\n"
+                f"• **5 years** - RM {renew_fee_per_year * 5:.2f}\n\n"
+                f"*Available: 1 to 10 years (RM 30.00 per year)*\n\n"
+                f"Please reply with the **number of years** you want (e.g., \"3\" for 3 years). 😊"
             )
+        elif workflow_state == 'confirming_payment_details':
+            # User selected duration, now show payment confirmation
+            try:
+                client_payment = _connect_mongo()
+                chats_db = client_payment['chats']
+                user_coll = chats_db[user_id]
+                current_session = user_coll.find_one({'sessionId': session_id})
+                
+                # Get stored duration and cost
+                duration_years = 1
+                total_cost = 30.00
+                if current_session and current_session.get('context'):
+                    duration_years = current_session['context'].get(f'{service_name}_duration_years', 1)
+                    total_cost = current_session['context'].get(f'{service_name}_renew_fee', 30.00)
+                
+                # Calculate new expiry date
+                from datetime import datetime, timedelta
+                try:
+                    if valid_to:
+                        current_expiry = datetime.strptime(valid_to, '%Y-%m-%d')
+                        new_expiry = current_expiry + timedelta(days=365 * duration_years)
+                        new_expiry_str = new_expiry.strftime('%Y-%m-%d')
+                    else:
+                        new_expiry_str = 'N/A'
+                except:
+                    new_expiry_str = 'N/A'
+                
+                client_payment.close()
+                
+                return (
+                    f"**Payment Confirmation 💳**\n\n"
+                    f"**License Details:**\n"
+                    f"• License No: {license_number or 'N/A'}\n"
+                    f"• Current Expiry: {valid_to or 'N/A'}\n"
+                    f"• Extension: {duration_years} year{'s' if duration_years > 1 else ''}\n"
+                    f"• New Expiry: {new_expiry_str}\n\n"
+                    f"**Payment Summary:**\n"
+                    f"• Duration: {duration_years} year{'s' if duration_years > 1 else ''}\n"
+                    f"• Rate: RM 30.00 per year\n"
+                    f"• **Total Amount: RM {total_cost:.2f}**\n\n"
+                    f"Please confirm to proceed with payment. Reply **YES** to continue or **NO** to cancel. 😊"
+                )
+            except Exception:
+                return "Error retrieving payment details. Please try again."
+        elif workflow_state == 'payment_confirmed':
+            # Payment confirmed, show completion message
+            try:
+                client_completion = _connect_mongo()
+                chats_db = client_completion['chats']
+                user_coll = chats_db[user_id]
+                current_session = user_coll.find_one({'sessionId': session_id})
+                
+                # Get stored renewal details
+                duration_years = 1
+                total_cost = 30.00
+                if current_session and current_session.get('context'):
+                    duration_years = current_session['context'].get(f'{service_name}_duration_years', 1)
+                    total_cost = current_session['context'].get(f'{service_name}_renew_fee', 30.00)
+                
+                client_completion.close()
+                
+                return (
+                    f"**🎉 License Renewal Successful! 🎉**\n\n"
+                    f"**Transaction Completed:**\n"
+                    f"• License No: {license_number or 'N/A'}\n"
+                    f"• Extension: {duration_years} year{'s' if duration_years > 1 else ''}\n"
+                    f"• Amount Paid: RM {total_cost:.2f}\n\n"
+                    f"**Important:**\n"
+                    f"• Your license has been successfully renewed\n"
+                    f"• You will receive a confirmation email shortly\n"
+                    f"• Please keep this transaction reference for your records\n\n"
+                    f"Thank you for using MyGovHub services! 😊\n\n"
+                    f"MyGovHub Support Team"
+                )
+            except Exception:
+                return "License renewal completed successfully! You will receive a confirmation email shortly."
         else:
             # First time or default - show license info and ask for confirmation
             # Set workflow state to track that we've shown license info
@@ -1764,6 +1846,12 @@ def lambda_handler(event, context):
             _update_service_workflow_state('license_confirmed')
             if _should_log():
                 logger.info('User confirmed license renewal, updated workflow state')
+        elif current_workflow_state == 'confirming_payment_details':
+            # User confirmed payment, process the renewal
+            _update_service_workflow_state('payment_confirmed')
+            intent_type = 'license_payment_confirmed'
+            if _should_log():
+                logger.info('User confirmed license renewal payment, updated workflow state')
     
     # Check for service-specific cancellation (when service is active and user says no)
     elif active_service == 'renew_license' and _is_negative(message_lower) and not unverified_doc_key:
@@ -1808,6 +1896,89 @@ def lambda_handler(event, context):
             except Exception as e:
                 if _should_log():
                     logger.error('Failed to cancel service workflow: %s', str(e))
+        elif current_workflow_state == 'confirming_payment_details':
+            # User declined payment, cancel the service
+            try:
+                client_cancel = _connect_mongo()
+                chats_db = client_cancel['chats']
+                user_coll = chats_db[user_id]
+                session_current = new_session_generated if new_session_generated else session_id
+                
+                # Set workflow state to cancelled and session status to cancelled
+                user_coll.update_one(
+                    {'sessionId': session_current}, 
+                    {'$set': {
+                        f'context.{active_service}_workflow_state': 'action_cancelled',
+                        'status': 'cancelled'
+                    }}
+                )
+                
+                # Set intent type to force connection end
+                intent_type = 'force_end_connection'
+                
+                if _should_log():
+                    logger.info('User declined license renewal payment, marked session as cancelled')
+                
+                client_cancel.close()
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to cancel service workflow: %s', str(e))
+
+    # Check for duration selection (when user provides number of years)
+    elif active_service == 'renew_license' and not unverified_doc_key and not intent_type:
+        # Check if we're in asking_duration state and user provided a number
+        current_workflow_state = None
+        try:
+            client_check_duration = _connect_mongo()
+            chats_db = client_check_duration['chats']
+            user_coll = chats_db[user_id]
+            session_current = new_session_generated if new_session_generated else session_id
+            current_session = user_coll.find_one({'sessionId': session_current})
+            if current_session and current_session.get('context'):
+                current_workflow_state = current_session['context'].get(f'{active_service}_workflow_state')
+            client_check_duration.close()
+        except Exception:
+            pass
+        
+        if current_workflow_state == 'asking_duration':
+            # Try to parse duration from user message
+            import re
+            duration_match = re.search(r'\b(\d{1,2})\b', message.strip())
+            if duration_match:
+                years = int(duration_match.group(1))
+                if 1 <= years <= 10:  # Valid range
+                    renew_fee_per_year = 30.00
+                    renew_fee = years * renew_fee_per_year
+                    
+                    # Store the selected duration and cost
+                    try:
+                        client_store_duration = _connect_mongo()
+                        chats_db = client_store_duration['chats']
+                        user_coll = chats_db[user_id]
+                        session_current = new_session_generated if new_session_generated else session_id
+                        
+                        user_coll.update_one(
+                            {'sessionId': session_current}, 
+                            {'$set': {
+                                f'context.{active_service}_workflow_state': 'confirming_payment_details',
+                                f'context.{active_service}_duration_years': years,
+                                f'context.{active_service}_renew_fee': renew_fee
+                            }}
+                        )
+                        
+                        if _should_log():
+                            logger.info('User selected %d years renewal, cost: RM %.2f', years, total_cost)
+                        
+                        # Set intent to trigger payment confirmation message
+                        intent_type = 'license_duration_selected'
+                        
+                        client_store_duration.close()
+                    except Exception as e:
+                        if _should_log():
+                            logger.error('Failed to store duration selection: %s', str(e))
+                else:
+                    if _should_log():
+                        logger.info('Invalid duration provided: %d (must be 1-10)', years)
 
     service_ready = False
     if active_service:
