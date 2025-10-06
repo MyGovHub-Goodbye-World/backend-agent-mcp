@@ -1361,7 +1361,11 @@ def lambda_handler(event, context):
 
     def _is_affirmative(msg: str) -> bool:
         # Accept short pure confirmations only; reject if appears to contain field corrections
-        aff_tokens = {'yes', 'ya', 'y', 'ok', 'okay', 'correct', 'accurate', 'looks good', 'betul', 'ya betul'}
+        aff_tokens = {
+            'yes', 'ya', 'y', 'ok', 'okay', 'true', 'benar', 'sure',
+            'correct', 'accurate', 'looks good', 'betul', 'ya betul',
+            'setuju', 'confirm'
+        }
         cleaned = msg.strip().lower()
         if len(cleaned) <= 15 and cleaned in aff_tokens:
             return True
