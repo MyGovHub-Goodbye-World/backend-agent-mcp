@@ -1492,7 +1492,7 @@ def lambda_handler(event, context):
     created_at_iso = dt.isoformat()
     created_at_z = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
-    # If new session, create sessionId and initialize collection/document in MongoDB (required)
+    # If new session or continue session, create sessionId and initialize collection/document in MongoDB (required)
     new_session_generated = None
     try:
         client = _connect_mongo()
@@ -1555,6 +1555,7 @@ def lambda_handler(event, context):
             }
             # Insert the document
             coll.insert_one(session_doc)
+
         else:
             # existing session: update ekyc if provided
             update_ops = {}
@@ -2447,6 +2448,19 @@ def lambda_handler(event, context):
                     "'How can I help you today?'.\n\n"
                     "IMPORTANT: Respond ONLY with the welcome message text (no JSON, no explanations, no metadata)."
                 )
+            elif session_id == '(continue-session)':
+                # For continue session, provide direct services menu like continue_services intent
+                response_text = (
+                    "Perfect! I'm here to help with any other government services you need. "
+                    "You can:\n\n"
+                    "🔄 Renew your driving license\n"
+                    "💡 Pay TNB electricity bills\n"
+                    "📄 Apply for permits\n"
+                    "📋 Check application status\n"
+                    "📁 Access official documents\n\n"
+                    "What would you like to do next?"
+                )
+                model_error = None  # No model error since we're bypassing the AI model
             elif intent_type == 'document_processing' and ocr_result:
                 # Use document analysis prompt for processed documents
                 prompt = _generate_document_analysis_prompt(ocr_result, message)
@@ -2798,22 +2812,18 @@ def lambda_handler(event, context):
 
             # push the assistant message; if model failed, store an error message as assistant reply
             assistant_message_id = str(uuid.uuid4())
-            # Generate new timestamp for assistant response (when we actually respond)
-            assistant_timestamp = datetime.now(timezone.utc)
-            assistant_timestamp_iso = assistant_timestamp.isoformat()
-            assistant_timestamp_z = assistant_timestamp_iso.replace('+00:00', 'Z')
             
             if response_text is not None:
                 assistant_msg_doc = {
                     'messageId': assistant_message_id,
-                    'timestamp': assistant_timestamp_iso,
+                    'timestamp': created_at_iso,
                     'role': 'assistant',
                     'content': [{'text': str(response_text)}]
                 }
             else:
                 assistant_msg_doc = {
                     'messageId': assistant_message_id,
-                    'timestamp': assistant_timestamp_iso,
+                    'timestamp': created_at_iso,
                     'role': 'assistant',
                     'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}],
                     'meta': {'modelError': model_error}
@@ -2838,8 +2848,49 @@ def lambda_handler(event, context):
             except Exception:
                 pass
 
+        # Handle continue_services by creating new session
+        continue_services_new_session = None
+        if intent_type == 'continue_services':
+            try:
+                client_continue = _connect_mongo()
+                db_continue = client_continue['chats']
+                coll_continue = db_continue[user_id]
+                
+                # Mark current session as completed
+                session_to_complete = new_session_generated if new_session_generated else session_id
+                coll_continue.update_one(
+                    {'sessionId': session_to_complete}, 
+                    {'$set': {'status': 'completed'}}
+                )
+                
+                # Create new session for continue services
+                continue_services_new_session = str(uuid.uuid4())
+                
+                # Archive any other active sessions
+                coll_continue.update_many({'status': 'active'}, {'$set': {'status': 'archived'}})
+                
+                # Create new session document
+                new_session_doc = {
+                    'sessionId': continue_services_new_session,
+                    'createdAt': created_at_iso,
+                    'messages': [],
+                    'status': 'active',
+                    'service': '',
+                    'context': {},
+                    'ekyc': {}
+                }
+                coll_continue.insert_one(new_session_doc)
+                
+                if _should_log():
+                    logger.info('Created new session for continue_services: %s', continue_services_new_session)
+                
+                client_continue.close()
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to create new session for continue_services: %s', str(e))
+        
         # Update session status to 'completed' if in confirming end connection state
-        if intent_type == 'confirming_end_connection':
+        elif intent_type == 'confirming_end_connection':
             try:
                 client_complete = _connect_mongo()
                 db_complete = client_complete['chats']
@@ -2852,7 +2903,7 @@ def lambda_handler(event, context):
                 )
                 
                 if _should_log():
-                    logger.info('Updated session status to completed for confirming_end_connection intent: %s', session_to_complete)
+                    logger.info('Updated session status to completed for %s intent: %s', intent_type, session_to_complete)
                 
                 client_complete.close()
             except Exception as e:
@@ -2865,8 +2916,8 @@ def lambda_handler(event, context):
             'data': {
                 'messageId': message_id,
                 'message': response_text if response_text is not None else 'ERROR: assistant failed to respond',
-                'createdAt': assistant_timestamp_z,
-                'sessionId': '(new-session)' if intent_type in ('force_end_connection', 'end_connection') else session_to_update,
+                'createdAt': created_at_iso,
+                'sessionId': '(new-session)' if intent_type in ('force_end_connection', 'end_connection') else (continue_services_new_session if intent_type == 'continue_services' else session_to_update),
                 'attachment': body.get('attachment') or []
             }
         }
@@ -2879,6 +2930,8 @@ def lambda_handler(event, context):
                     logger.info('Force end connection - returning (new-session) to restart conversation')
                 elif intent_type == 'end_connection':
                     logger.info('End connection - returning (new-session) to restart conversation')
+                elif intent_type == 'continue_services':
+                    logger.info('Continue services - returning new UUID session: %s', continue_services_new_session)
 
         if model_error:
             resp_body['data']['modelError'] = model_error
