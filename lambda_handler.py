@@ -2396,9 +2396,59 @@ def lambda_handler(event, context):
                 # Use document analysis prompt for processed documents
                 prompt = _generate_document_analysis_prompt(ocr_result, message)
             elif intent_type == 'document_verified':
-                # Post-verification: intentionally no special prompt; generic context builder will handle.
-                # Keeping an explicit no-op to avoid accidental fall-through confusion.
-                pass
+                # Document verified - provide category-specific suggestions if no active service
+                if not active_service:
+                    # Get the detected category from the verified document
+                    detected_category = None
+                    if session_doc and session_doc.get('context'):
+                        for doc_key, doc_data in session_doc['context'].items():
+                            if doc_data.get('isVerified') == 'verified' and doc_data.get('categoryDetection'):
+                                detected_category = doc_data['categoryDetection'].get('detected_category')
+                                break
+                    
+                    # Provide category-specific suggestions
+                    if detected_category == 'tnb':
+                        prompt = (
+                            "SYSTEM: The user has verified their TNB electricity bill document. "
+                            "Provide a brief acknowledgment and specifically suggest TNB bill payment service. "
+                            "Keep it helpful and concise.\n\n"
+                            f"User message: {message}\n\n"
+                            "Respond with: 'Thank you for verifying your TNB bill information! "
+                            "I can help you pay this electricity bill right away. Would you like me to "
+                            "proceed with the TNB bill payment process? Just reply YES to continue.'"
+                        )
+                    elif detected_category in ('idcard', 'license', 'license-front', 'license-back'):
+                        prompt = (
+                            "SYSTEM: The user has verified their ID card or license document. "
+                            "Provide a brief acknowledgment and specifically suggest license renewal service. "
+                            "Keep it helpful and concise.\n\n"
+                            f"User message: {message}\n\n"
+                            "Respond with: 'Thank you for verifying your document information! "
+                            "I can help you renew your driving license. Would you like me to "
+                            "proceed with the license renewal process? Just reply YES to continue.'"
+                        )
+                    else:
+                        # Generic fallback for unknown categories
+                        prompt = (
+                            "SYSTEM: The user has just verified their uploaded document information. "
+                            "Provide a brief acknowledgment and suggest relevant government services they might need. "
+                            "Keep it helpful and concise. "
+                            "For ID cards or licenses, suggest license renewal services. "
+                            "For bills, suggest bill payment services. "
+                            "Always end with asking how you can help them today.\n\n"
+                            f"User message: {message}\n\n"
+                            "Respond with a helpful message acknowledging the document verification and suggesting next steps."
+                        )
+                else:
+                    # Active service exists - let the service workflow handle the verified document
+                    # This will be handled by the service next-step logic above
+                    prompt = (
+                        "SYSTEM: The user has verified their document and an active service is in progress. "
+                        "Provide a brief acknowledgment and proceed with the service workflow.\n\n"
+                        f"Active service: {active_service}\n"
+                        f"User message: {message}\n\n"
+                        "Acknowledge the verification and continue with the service process."
+                    )
             elif intent_type == 'document_correction_needed':
                 # User said the information is wrong, ask for specifics
                 extracted_data = unverified_doc_data.get('extractedData', {}) if unverified_doc_data else {}
