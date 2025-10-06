@@ -2221,11 +2221,34 @@ def lambda_handler(event, context):
             pass
         
         if current_workflow_state == 'asking_duration':
-            # Try to parse duration from user message
+            # Try to parse duration from user message - accept both digits and word numbers
             import re
-            duration_match = re.search(r'\b(\d{1,2})\b', message.strip())
+            message_clean = message.strip().lower()
+            
+            # Word-to-number mapping (English and Malay)
+            word_to_number = {
+                'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+                'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+                'satu': 1, 'dua': 2, 'tiga': 3, 'empat': 4, 'lima': 5,
+                'enam': 6, 'tujuh': 7, 'lapan': 8, 'sembilan': 9, 'sepuluh': 10
+            }
+            
+            years = None
+            
+            # Try parsing as pure digit first
+            duration_match = re.match(r'^\s*(\d{1,2})\s*$', message.strip())
             if duration_match:
                 years = int(duration_match.group(1))
+            else:
+                # Try parsing as word number (with optional "years"/"tahun")
+                # Remove common suffixes like "years", "year", "tahun"
+                cleaned_message = re.sub(r'\b(years?|tahun)\b', '', message_clean).strip()
+                
+                # Check for exact word number match
+                if cleaned_message in word_to_number:
+                    years = word_to_number[cleaned_message]
+            
+            if years is not None:
                 if 1 <= years <= 10:  # Valid range
                     renew_fee_per_year = 30.00
                     renew_fee = years * renew_fee_per_year
@@ -2259,6 +2282,12 @@ def lambda_handler(event, context):
                 else:
                     if _should_log():
                         logger.info('Invalid duration provided: %d (must be 1-10)', years)
+            else:
+                # Invalid input format (contains words, letters, or non-numeric input)
+                if _should_log():
+                    logger.info('Invalid duration format provided: "%s" (must be a number 1-10)', message.strip())
+                # Set intent to ask for valid numeric input
+                intent_type = 'invalid_duration_format'
 
     # Check for TNB bill payment confirmations (when service is active and user says yes)
     elif active_service == 'pay_tnb_bill' and _is_affirmative(message_lower) and not unverified_doc_key:
@@ -2833,6 +2862,18 @@ def lambda_handler(event, context):
                     "📋 Check application status\n"
                     "📁 Access official documents\n\n"
                     "What would you like to do next?"
+                )
+                model_error = None  # No model error since we're bypassing the AI model
+            elif intent_type == 'invalid_duration_format':
+                # User provided invalid duration format - use direct response
+                response_text = (
+                    "⚠️ **Invalid Format**\n\n"
+                    "Please enter the number of years (1-10) in one of these formats:\n\n"
+                    "**Numbers:** `2`, `5`, `10`\n"
+                    "**English words:** `two`, `five`, `ten`\n"
+                    "**Malay words:** `dua`, `lima`, `sepuluh`\n\n"
+                    "You can also add 'years' or 'tahun': `2 years`, `lima tahun`\n\n"
+                    "How many years would you like to renew your license for?"
                 )
                 model_error = None  # No model error since we're bypassing the AI model
             else:
