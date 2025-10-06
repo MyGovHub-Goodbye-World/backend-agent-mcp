@@ -2481,13 +2481,66 @@ def lambda_handler(event, context):
                     if _should_log():
                         logger.error('Failed during identity mismatch check: %s', str(sec_e))
 
+                # Check document category if there's an active service
+                detected_category = ocr_result.get('category_detection', {}).get('detected_category', 'unknown')
+                
+                # Validate document category against active service requirements
+                if active_service:
+                    required_category_sets = {
+                        'renew_license': {'allowed': {'idcard', 'license', 'license-front'}},
+                        'pay_tnb_bill': {'allowed': {'tnb'}},
+                    }
+                    
+                    allowed_categories = required_category_sets.get(active_service, {}).get('allowed', set())
+                    
+                    if detected_category not in allowed_categories:
+                        # Wrong document category for active service
+                        if active_service == 'renew_license':
+                            wrong_doc_message = (
+                                "❌ **Document Type Mismatch**\n\n"
+                                f"I detected this document as: **{detected_category}**\n\n"
+                                "For license renewal, please upload:\n"
+                                "📸 **Your current driving license** (front side), or\n"
+                                "📸 **Your IC (Identity Card)** (front side)\n\n"
+                                "Please upload the correct document type to proceed with your license renewal."
+                            )
+                        elif active_service == 'pay_tnb_bill':
+                            wrong_doc_message = (
+                                "❌ **Document Type Mismatch**\n\n"
+                                f"I detected this document as: **{detected_category}**\n\n"
+                                "For TNB bill payment, please upload:\n"
+                                "📸 **Your TNB electricity bill** (showing account number and amount)\n\n"
+                                "Please upload your TNB bill to proceed with the payment."
+                            )
+                        else:
+                            wrong_doc_message = (
+                                f"❌ **Document Type Mismatch**\n\n"
+                                f"I detected this document as: **{detected_category}**\n\n"
+                                f"This document type is not supported for the {active_service} service. "
+                                "Please upload the correct document type."
+                            )
+                        
+                        # Return early with wrong document message
+                        resp_body = {
+                            'status': {'statusCode': 200, 'message': 'Success'},
+                            'data': {
+                                'messageId': message_id,
+                                'message': wrong_doc_message,
+                                'createdAt': created_at_z,
+                                'sessionId': session_id if session_id not in ('(new-session)', '(session-end)') else new_session_generated,
+                                'attachment': attachments,
+                                'intent_type': 'wrong_document_category'
+                            }
+                        }
+                        return _cors_response(200, resp_body)
+
                 intent_type = 'document_processing'
                 session_to_save = new_session_generated if new_session_generated else session_id
                 _save_document_context_to_session(user_id, session_to_save, ocr_result, attachment['name'])
                 
                 if _should_log():
                     logger.info('Document processed successfully. Category: %s, Intent type: %s', 
-                                ocr_result.get('category_detection', {}).get('detected_category', 'unknown'), intent_type)
+                                detected_category, intent_type)
 
     # Determine prompt for Bedrock.
     try:
