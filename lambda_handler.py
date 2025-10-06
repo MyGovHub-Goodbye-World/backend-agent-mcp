@@ -1846,7 +1846,7 @@ def lambda_handler(event, context):
         elif current_workflow_state == 'confirming_payment_details':
             # User confirmed payment, process the renewal
             _update_service_workflow_state('payment_confirmed')
-            intent_type = 'license_payment_confirmed'
+            intent_type = f'{active_service}_payment_confirmed'
             if _should_log():
                 logger.info('User confirmed license renewal payment, updated workflow state')
     
