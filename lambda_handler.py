@@ -403,6 +403,19 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     duration_years = current_session['context'].get(f'{service_name}_duration_years', 1)
                     renew_fee = current_session['context'].get(f'{service_name}_renew_fee', 30.00)
                 
+                # Set intent to redirect to confirming_end_connection after completion
+                try:
+                    user_coll.update_one(
+                        {'sessionId': session_id}, 
+                        {'$set': {
+                            'context.redirect_to_end_connection': True,
+                            'context.end_connection_reason': 'license_renewal_completed'
+                        }}
+                    )
+                except Exception as e:
+                    if _should_log():
+                        logger.error('Failed to set end connection redirect after license renewal: %s', str(e))
+                
                 client_completion.close()
                 
                 return (
@@ -416,6 +429,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     f"• You will receive a confirmation email shortly\n"
                     f"• Please keep this transaction reference for your records\n\n"
                     f"Thank you for using MyGovHub services! 😊\n\n"
+                    f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
                     f"MyGovHub Support Team"
                 )
             except Exception:
@@ -540,7 +554,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
             return (
                 f"Great news! I checked your TNB account ({account_number}) and found no outstanding bills. "
                 "All your bills appear to be paid up to date. 🎉\n\n"
-                "Is there anything else I can help you with today? Reply YES if you need other services, or NO to end our session."
+                "Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session."
             )
         
         # Handle different workflow states
@@ -2657,7 +2671,7 @@ def lambda_handler(event, context):
                 # Ask user if they want to continue with other services or end session - use direct response
                 response_text = (
                     "Is there anything else I can help you with today? "
-                    "Reply YES if you need other services, or NO to end our session.\n\n"
+                    "Reply **YES** if you need other services, or **NO** to end our session.\n\n"
                     "MyGovHub Support Team"
                 )
                 model_error = None  # No model error since we're bypassing the AI model
