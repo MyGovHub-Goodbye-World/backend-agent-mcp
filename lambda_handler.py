@@ -1525,7 +1525,7 @@ def lambda_handler(event, context):
         coll = db[user_id]
         # Attempt to fetch existing session document so we can provide history/ekyc to the model
         session_doc = None
-        if session_id and session_id != '(new-session)':
+        if session_id and session_id not in ('(new-session)', '(session-end)'):
             try:
                 if _should_log():
                     logger.info('Fetching session from MongoDB: user=%s sessionId=%s', user_id, session_id)
@@ -1548,7 +1548,7 @@ def lambda_handler(event, context):
             except Exception:
                 logger.exception('Error fetching session document for user=%s sessionId=%s', user_id, session_id)
                 session_doc = None
-        if session_id == '(new-session)':
+        if session_id in ('(new-session)', '(session-end)'):
             new_session_generated = str(uuid.uuid4())
             # Archive any other active sessions for this user
             try:
@@ -2361,7 +2361,7 @@ def lambda_handler(event, context):
                             'messageId': message_id,
                             'message': blur_message,
                             'createdAt': created_at_z,
-                            'sessionId': session_id if session_id != '(new-session)' else new_session_generated,
+                            'sessionId': session_id if session_id not in ('(new-session)', '(session-end)') else new_session_generated,
                             'attachment': attachments,
                             'intent_type': 'document_quality_issue'
                         }
@@ -2399,7 +2399,7 @@ def lambda_handler(event, context):
                                     'messageId': message_id,
                                     'message': mismatch_message,
                                     'createdAt': created_at_z,
-                                    'sessionId': session_id if session_id != '(new-session)' else new_session_generated,
+                                    'sessionId': session_id if session_id not in ('(new-session)', '(session-end)') else new_session_generated,
                                     'attachment': attachments,
                                     'intent_type': 'identity_mismatch'
                                 }
@@ -2451,8 +2451,41 @@ def lambda_handler(event, context):
             if _should_log():
                 logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
 
-            if session_id == '(new-session)':
-                # For first-time connection, request a welcome message.
+            if intent_type == 'renew_license':
+                # License renewal intent - use existing prompt logic
+                prompt = (
+                    "SYSTEM: Respond with ONLY the following guidance (no extra elaboration beyond minor natural phrasing allowed).\n\n"
+                    "USER-FACING MESSAGE:\n"
+                    "I can help you renew your driving license!\n\n"
+                    "To proceed with the renewal, I need to verify your identity and current license details. Please upload one of the following documents:\n\n"
+                    "📸 Option 1: Your current driving license (photo of the front side)\n"
+                    "📸 Option 2: Your IC (Identity Card) - front side\n\n"
+                    "Please take a clear photo and send it to me. I'll extract the necessary information to process your license renewal.\n"
+                    "If you already uploaded a document earlier and it's verified, just reply YES to proceed with renewal steps."
+                )
+            elif intent_type == 'pay_tnb_bill':
+                # TNB bill payment intent - use existing prompt logic
+                prompt = (
+                    "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
+                    "USER-FACING MESSAGE:\n"
+                    "I can help you pay your TNB electricity bill! ⚡\n\n"
+                    "To process your bill payment, I need to verify your account details and bill information. Please upload:\n\n"
+                    "📸 TNB Bill Document: Take a photo of your TNB bill (the upper portion showing your account number and amount due)\n\n"
+                    "Please ensure the photo is clear and all important details are visible. I'll extract the account information to help you with the payment process."
+                )
+            elif session_id == '(new-session)':
+                # For first-time connection without service intent, request a welcome message
+                prompt = (
+                    "SYSTEM: You are a friendly assistant that composes a short welcome message "
+                    "for a government services portal called MyGovHub. The message MUST mention "
+                    "that MyGovHub provides these services: license renewal, bill payments, "
+                    "permit applications, checking application status, and accessing official documents. "
+                    "Keep it concise (max ~120 words), helpful, and end with a call-to-action such as "
+                    "'How can I help you today?'.\n\n"
+                    "IMPORTANT: Respond ONLY with the welcome message text (no JSON, no explanations, no metadata)."
+                )
+            elif session_id == '(session-end)':
+                # For session-end without service intent, request a welcome message
                 prompt = (
                     "SYSTEM: You are a friendly assistant that composes a short welcome message "
                     "for a government services portal called MyGovHub. The message MUST mention "
@@ -2638,26 +2671,7 @@ def lambda_handler(event, context):
                     prompt = f"SYSTEM: Error processing corrections. User message: {message}"
                     if _should_log():
                         logger.error('Failed to retrieve updated document data: %s', str(e))
-            elif intent_type == 'renew_license':
-                prompt = (
-                    "SYSTEM: Respond with ONLY the following guidance (no extra elaboration beyond minor natural phrasing allowed).\n\n"
-                    "USER-FACING MESSAGE:\n"
-                    "I can help you renew your driving license!\n\n"
-                    "To proceed with the renewal, I need to verify your identity and current license details. Please upload one of the following documents:\n\n"
-                    "📸 Option 1: Your current driving license (photo of the front side)\n"
-                    "📸 Option 2: Your IC (Identity Card) - front side\n\n"
-                    "Please take a clear photo and send it to me. I'll extract the necessary information to process your license renewal.\n"
-                    "If you already uploaded a document earlier and it's verified, just reply YES to proceed with renewal steps."
-                )
-            elif intent_type == 'pay_tnb_bill':
-                prompt = (
-                    "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-                    "USER-FACING MESSAGE:\n"
-                    "I can help you pay your TNB electricity bill! ⚡\n\n"
-                    "To process your bill payment, I need to verify your account details and bill information. Please upload:\n\n"
-                    "📸 TNB Bill Document: Take a photo of your TNB bill (the upper portion showing your account number and amount due)\n\n"
-                    "Please ensure the photo is clear and all important details are visible. I'll extract the account information to help you with the payment process."
-                )
+
             elif intent_type == 'force_end_connection':
                 # User declined service, end the session and force restart
                 prompt = (
@@ -2931,7 +2945,7 @@ def lambda_handler(event, context):
                 'messageId': message_id,
                 'message': response_text if response_text is not None else 'ERROR: assistant failed to respond',
                 'createdAt': created_at_iso,
-                'sessionId': '(new-session)' if intent_type in ('force_end_connection', 'end_connection') else (continue_services_new_session if intent_type == 'continue_services' else session_to_update),
+                'sessionId': '(session-end)' if intent_type in ('force_end_connection', 'end_connection') else (continue_services_new_session if intent_type == 'continue_services' else session_to_update),
                 'attachment': body.get('attachment') or []
             }
         }
@@ -2941,9 +2955,9 @@ def lambda_handler(event, context):
             if _should_log():
                 logger.info('Final response includes intent_type: %s', intent_type)
                 if intent_type == 'force_end_connection':
-                    logger.info('Force end connection - returning (new-session) to restart conversation')
+                    logger.info('Force end connection - returning (session-end) to indicate session termination')
                 elif intent_type == 'end_connection':
-                    logger.info('End connection - returning (new-session) to restart conversation')
+                    logger.info('End connection - returning (session-end) to indicate session termination')
                 elif intent_type == 'continue_services':
                     logger.info('Continue services - returning new UUID session: %s', continue_services_new_session)
 
