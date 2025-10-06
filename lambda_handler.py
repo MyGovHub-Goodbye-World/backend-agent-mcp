@@ -357,10 +357,10 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                 
                 # Get stored duration and cost
                 duration_years = 1
-                total_cost = 30.00
+                renew_fee = 30.00
                 if current_session and current_session.get('context'):
                     duration_years = current_session['context'].get(f'{service_name}_duration_years', 1)
-                    total_cost = current_session['context'].get(f'{service_name}_renew_fee', 30.00)
+                    renew_fee = current_session['context'].get(f'{service_name}_renew_fee', 30.00)
                 
                 # Calculate new expiry date
                 from datetime import datetime, timedelta
@@ -383,7 +383,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     f"• Current Expiry: {valid_to or 'N/A'}\n"
                     f"• Extension: {duration_years} year{'s' if duration_years > 1 else ''}\n"
                     f"• New Expiry: {new_expiry_str}\n\n"
-                    f"**Total Amount: RM {total_cost:.2f}**\n\n"
+                    f"**Total Amount: RM {renew_fee:.2f}**\n\n"
                     f"Please confirm to proceed with payment. Reply **YES** to continue or **NO** to cancel. 😊"
                 )
             except Exception:
@@ -398,10 +398,10 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                 
                 # Get stored renewal details
                 duration_years = 1
-                total_cost = 30.00
+                renew_fee = 30.00
                 if current_session and current_session.get('context'):
                     duration_years = current_session['context'].get(f'{service_name}_duration_years', 1)
-                    total_cost = current_session['context'].get(f'{service_name}_renew_fee', 30.00)
+                    renew_fee = current_session['context'].get(f'{service_name}_renew_fee', 30.00)
                 
                 client_completion.close()
                 
@@ -410,7 +410,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     f"**Transaction Completed:**\n"
                     f"• License No: {license_number or 'N/A'}\n"
                     f"• Extension: {duration_years} year{'s' if duration_years > 1 else ''}\n"
-                    f"• Amount Paid: RM {total_cost:.2f}\n\n"
+                    f"• Amount Paid: RM {renew_fee:.2f}\n\n"
                     f"**Important:**\n"
                     f"• Your license has been successfully renewed\n"
                     f"• You will receive a confirmation email shortly\n"
@@ -1959,12 +1959,12 @@ def lambda_handler(event, context):
                             {'$set': {
                                 f'context.{active_service}_workflow_state': 'confirming_payment_details',
                                 f'context.{active_service}_duration_years': years,
-                                f'context.{active_service}_renew_fee': renew_fee
+                                f'context.{active_service}_renew_fee': round(renew_fee, 2)
                             }}
                         )
                         
                         if _should_log():
-                            logger.info('User selected %d years renewal, cost: RM %.2f', years, total_cost)
+                            logger.info('User selected %d years renewal, cost: RM %.2f', years, renew_fee)
                         
                         # Set intent to trigger payment confirmation message
                         intent_type = 'license_duration_selected'
