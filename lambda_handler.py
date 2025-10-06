@@ -518,9 +518,29 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
             return "Bill details verified, but I couldn't retrieve your bill records right now. Please try again shortly or provide more details."
         
         if not bills_to_pay:
+            # Set intent to redirect to confirming_end_connection
+            try:
+                client_redirect = _connect_mongo()
+                chats_db = client_redirect['chats']
+                user_coll = chats_db[user_id]
+                
+                # Set context flag to trigger confirming_end_connection intent
+                user_coll.update_one(
+                    {'sessionId': session_id}, 
+                    {'$set': {
+                        'context.redirect_to_end_connection': True,
+                        'context.end_connection_reason': 'no_outstanding_bills'
+                    }}
+                )
+                client_redirect.close()
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to set end connection redirect: %s', str(e))
+                    
             return (
                 f"Great news! I checked your TNB account ({account_number}) and found no outstanding bills. "
-                "All your bills appear to be paid up to date. 🎉"
+                "All your bills appear to be paid up to date. 🎉\n\n"
+                "Is there anything else I can help you with today? Reply YES if you need other services, or NO to end our session."
             )
         
         # Handle different workflow states
@@ -2220,6 +2240,40 @@ def lambda_handler(event, context):
                 if _should_log():
                     logger.error('Failed to cancel TNB bill payment workflow: %s', str(e))
 
+    # Check for confirming_end_connection and end_connection intents
+    if not intent_type and session_doc and session_doc.get('context', {}).get('redirect_to_end_connection'):
+        # User was redirected to end connection confirmation
+        if _is_affirmative(message_lower):
+            # User wants to continue with other services, clear the redirect flag
+            try:
+                client_clear = _connect_mongo()
+                chats_db = client_clear['chats']
+                user_coll = chats_db[user_id]
+                session_current = new_session_generated if new_session_generated else session_id
+                
+                user_coll.update_one(
+                    {'sessionId': session_current}, 
+                    {'$unset': {
+                        'context.redirect_to_end_connection': "",
+                        'context.end_connection_reason': ""
+                    }}
+                )
+                client_clear.close()
+                
+                # Set intent to continue with services
+                intent_type = 'continue_services'
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to clear end connection redirect: %s', str(e))
+                    
+        elif _is_negative(message_lower):
+            # User wants to end the session
+            intent_type = 'end_connection'
+            
+        else:
+            # User's response is unclear, set intent to ask for clarification
+            intent_type = 'confirming_end_connection'
+
     service_ready = False
     if active_service:
         service_ready = _service_requirements_met(active_service, session_doc)
@@ -2352,7 +2406,8 @@ def lambda_handler(event, context):
     try:
         # If a service is active and requirements are met, bypass model with deterministic next-step prompt
         if active_service and service_ready and intent_type not in (
-            'document_processing', 'document_correction_needed', 'document_correction_provided', 'force_end_connection'
+            'document_processing', 'document_correction_needed', 'document_correction_provided', 'force_end_connection',
+            'confirming_end_connection', 'end_connection', 'continue_services'
         ):
             # Get service message (may be direct message or AI prompt)
             service_message = _build_service_next_step_message(active_service, user_id, session_id, session_doc)
@@ -2584,6 +2639,35 @@ def lambda_handler(event, context):
                     "Thank you for using MyGovHub services. Have a great day!\n\n"
                     "MyGovHub Support Team"
                 )
+            elif intent_type == 'confirming_end_connection':
+                # Ask user if they want to continue with other services or end session - use direct response
+                response_text = (
+                    "Is there anything else I can help you with today? "
+                    "Reply YES if you need other services, or NO to end our session.\n\n"
+                    "MyGovHub Support Team"
+                )
+                model_error = None  # No model error since we're bypassing the AI model
+            elif intent_type == 'end_connection':
+                # User wants to end the session, thank them and close - use direct response
+                response_text = (
+                    "Thank you for using MyGovHub! We're glad we could assist you today. "
+                    "Feel free to return anytime for your government service needs. Have a wonderful day! 🌟\n\n"
+                    "MyGovHub Support Team"
+                )
+                model_error = None  # No model error since we're bypassing the AI model
+            elif intent_type == 'continue_services':
+                # User wants to continue with other services - use direct response
+                response_text = (
+                    "Perfect! I'm here to help with any other government services you need. "
+                    "You can:\n\n"
+                    "🔄 Renew your driving license\n"
+                    "💡 Pay TNB electricity bills\n"
+                    "📄 Apply for permits\n"
+                    "📋 Check application status\n"
+                    "📁 Access official documents\n\n"
+                    "What would you like to do next?"
+                )
+                model_error = None  # No model error since we're bypassing the AI model
             else:
                 # Generic context-building order: 1) Document context summary 2) EKYC 3) Prior messages 4) Current user message
                 parts = []
@@ -2754,6 +2838,27 @@ def lambda_handler(event, context):
             except Exception:
                 pass
 
+        # Update session status to 'completed' if in confirming end connection state
+        if intent_type == 'confirming_end_connection':
+            try:
+                client_complete = _connect_mongo()
+                db_complete = client_complete['chats']
+                coll_complete = db_complete[user_id]
+                session_to_complete = new_session_generated if new_session_generated else session_id
+                
+                coll_complete.update_one(
+                    {'sessionId': session_to_complete}, 
+                    {'$set': {'status': 'completed'}}
+                )
+                
+                if _should_log():
+                    logger.info('Updated session status to completed for confirming_end_connection intent: %s', session_to_complete)
+                
+                client_complete.close()
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to update session status to completed: %s', str(e))
+
         # Prepare the MCP response payload. If model failed, still return 200 but include modelError flag
         resp_body = {
             'status': {'statusCode': 200, 'message': 'Success'},
@@ -2761,7 +2866,7 @@ def lambda_handler(event, context):
                 'messageId': message_id,
                 'message': response_text if response_text is not None else 'ERROR: assistant failed to respond',
                 'createdAt': assistant_timestamp_z,
-                'sessionId': '(new-session)' if intent_type == 'force_end_connection' else session_to_update,
+                'sessionId': '(new-session)' if intent_type in ('force_end_connection', 'end_connection') else session_to_update,
                 'attachment': body.get('attachment') or []
             }
         }
@@ -2772,6 +2877,8 @@ def lambda_handler(event, context):
                 logger.info('Final response includes intent_type: %s', intent_type)
                 if intent_type == 'force_end_connection':
                     logger.info('Force end connection - returning (new-session) to restart conversation')
+                elif intent_type == 'end_connection':
+                    logger.info('End connection - returning (new-session) to restart conversation')
 
         if model_error:
             resp_body['data']['modelError'] = model_error
