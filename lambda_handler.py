@@ -1611,88 +1611,107 @@ def lambda_handler(event, context):
                     
                     # Check session timeout (15 minutes) - skip if already awaiting timeout choice
                     if not session_doc.get('context', {}).get('timeout_awaiting_choice'):
-                        session_timeout_minutes = 15
+                        session_timeout_minutes = 15 # Short timeout for testing; change to 15 for production @TODO
                         current_time = datetime.now(timezone.utc)
                         
                         # Get last message timestamp from session
-                    last_message_time = None
-                    messages = session_doc.get('messages', [])
-                    if messages:
-                        # Get the most recent message by parsing timestamp strings
-                        def parse_timestamp_safe(ts_str):
-                            """Safely parse timestamp string to datetime for comparison"""
-                            if not ts_str or 'T' not in ts_str:
-                                return datetime.min.replace(tzinfo=timezone.utc)
+                        last_message_time = None
+                        messages = session_doc.get('messages', [])
+                        if messages:
+                            # Get the most recent message by parsing timestamp strings
+                            def parse_timestamp_safe(ts_str):
+                                """Safely parse timestamp string to datetime for comparison"""
+                                if not ts_str or 'T' not in ts_str:
+                                    return datetime.min.replace(tzinfo=timezone.utc)
+                                try:
+                                    # Parse MongoDB timestamp format (always uses +00:00, never Z)
+                                    return datetime.fromisoformat(ts_str)
+                                except Exception:
+                                    return datetime.min.replace(tzinfo=timezone.utc)
+                            
+                            # Find message with most recent timestamp
+                            last_msg = max(messages, key=lambda m: parse_timestamp_safe(m.get('timestamp', '')))
+                            last_msg_timestamp = last_msg.get('timestamp', '')
+                            
                             try:
-                                # Parse MongoDB timestamp format (always uses +00:00, never Z)
-                                return datetime.fromisoformat(ts_str)
-                            except Exception:
-                                return datetime.min.replace(tzinfo=timezone.utc)
-                        
-                        # Find message with most recent timestamp
-                        last_msg = max(messages, key=lambda m: parse_timestamp_safe(m.get('timestamp', '')))
-                        last_msg_timestamp = last_msg.get('timestamp', '')
-                        
-                        try:
-                            if last_msg_timestamp and 'T' in last_msg_timestamp:
-                                # Parse the timestamp string from MongoDB (always +00:00 format)
-                                last_message_time = datetime.fromisoformat(last_msg_timestamp)
-                                if _should_log():
-                                    logger.info('Parsed last message timestamp: %s -> %s', last_msg_timestamp, last_message_time)
-                        except Exception as e:
-                            if _should_log():
-                                logger.error('Failed to parse message timestamp %s: %s', last_msg_timestamp, str(e))
-                        
-                        # Fallback to session createdAt if message parsing failed
-                        if not last_message_time:
-                            try:
-                                session_created = session_doc.get('createdAt', '')
-                                if session_created and 'T' in session_created:
-                                    last_message_time = datetime.fromisoformat(session_created)
+                                if last_msg_timestamp and 'T' in last_msg_timestamp:
+                                    # Parse the timestamp string from MongoDB (always +00:00 format)
+                                    last_message_time = datetime.fromisoformat(last_msg_timestamp)
+                                    # Ensure it's timezone-aware (convert to UTC if naive)
+                                    if last_message_time.tzinfo is None:
+                                        last_message_time = last_message_time.replace(tzinfo=timezone.utc)
                                     if _should_log():
-                                        logger.info('Using session createdAt as fallback: %s -> %s', session_created, last_message_time)
+                                        logger.info('Parsed last message timestamp: %s -> %s', last_msg_timestamp, last_message_time)
                             except Exception as e:
                                 if _should_log():
-                                    logger.error('Failed to parse session createdAt: %s', str(e))
-                                last_message_time = None
-                    
-                    # Check if session has timed out
-                    if last_message_time and (current_time - last_message_time).total_seconds() > (session_timeout_minutes * 60):
-                        # Session has timed out - ask user to choose
-                        timeout_message = (
-                            "🕐 **Session Timeout**\n\n"
-                            f"Your session has been inactive for over {session_timeout_minutes} minutes.\n\n"
-                            "Would you like to:\n\n"
-                            "1. Continue your previous session (resume any ongoing services)\n"
-                            "2. Start fresh with a new conversation\n\n"
-                            "Please reply:\n"
-                            "• **CONTINUE** - to resume your session\n"
-                            "• **NEW** - to start a fresh conversation"
-                        )
+                                    logger.error('Failed to parse message timestamp %s: %s', last_msg_timestamp, str(e))
+                            
+                            # Fallback to session createdAt if message parsing failed
+                            if not last_message_time:
+                                try:
+                                    session_created = session_doc.get('createdAt', '')
+                                    if session_created and 'T' in session_created:
+                                        last_message_time = datetime.fromisoformat(session_created)
+                                        # Ensure it's timezone-aware (convert to UTC if naive)
+                                        if last_message_time.tzinfo is None:
+                                            last_message_time = last_message_time.replace(tzinfo=timezone.utc)
+                                        if _should_log():
+                                            logger.info('Using session createdAt as fallback: %s -> %s', session_created, last_message_time)
+                                except Exception as e:
+                                    if _should_log():
+                                        logger.error('Failed to parse session createdAt: %s', str(e))
+                                    last_message_time = None
                         
-                        # Set flag to indicate we're awaiting timeout choice
-                        context_update = {
-                            f'context.timeout_awaiting_choice': True
-                        }
-                        coll.update_one({'sessionId': session_id}, {'$set': context_update})
+                        # Check if session has timed out
+                        try:
+                            session_has_timed_out = (last_message_time and 
+                                                   (current_time - last_message_time).total_seconds() > (session_timeout_minutes * 60))
+                        except Exception as e:
+                            if _should_log():
+                                logger.error('Error calculating session timeout: %s, current_time=%s, last_message_time=%s', 
+                                            str(e), current_time, last_message_time)
+                            session_has_timed_out = False
                         
-                        resp_body = {
-                            'status': {'statusCode': 200, 'message': 'Success'},
-                            'data': {
-                                'messageId': message_id,
-                                'message': timeout_message,
-                                'createdAt': created_at_z,
-                                'sessionId': session_id,
-                                'attachment': attachments,
-                                'intent_type': 'session_timeout_choice'
+                        if session_has_timed_out:
+                            # Session has timed out - ask user to choose
+                            timeout_message = (
+                                "🕐 **Session Timeout**\n\n"
+                                f"Your session has been inactive for over {session_timeout_minutes} minutes.\n\n"
+                                "⚠️ **Your message was not processed** due to this timeout.\n\n"
+                                "Would you like to:\n\n"
+                                "1. Continue your previous session (resume any ongoing services)\n"
+                                "2. Start fresh with a new conversation\n\n"
+                                "Please reply:\n"
+                                "• **CONTINUE** - to resume your session\n"
+                                "• **NEW** - to start a fresh conversation"
+                            )
+                            
+                            # Set flag to indicate we're awaiting timeout choice
+                            context_update = {
+                                f'context.timeout_awaiting_choice': True
                             }
-                        }
-                        return _cors_response(200, resp_body)
+                            coll.update_one({'sessionId': session_id}, {'$set': context_update})
+                            
+                            resp_body = {
+                                'status': {'statusCode': 200, 'message': 'Success'},
+                                'data': {
+                                    'messageId': message_id,
+                                    'message': timeout_message,
+                                    'createdAt': created_at_z,
+                                    'sessionId': session_id,
+                                    'attachment': attachments,
+                                    'intent_type': 'session_timeout_choice'
+                                }
+                            }
+                            return _cors_response(200, resp_body)
                     
                     # Log the full session document from MongoDB (always)
                     try:
                         if _should_log():
                             logger.info('Full session document from MongoDB: %s', json.dumps(session_doc, default=str))
+                            # Also log timeout flag specifically for debugging
+                            timeout_flag = session_doc.get('context', {}).get('timeout_awaiting_choice')
+                            logger.info('Timeout awaiting choice flag: %s', timeout_flag)
                     except Exception:
                         logger.exception('Failed to log full session document from MongoDB')
                 else:
@@ -2019,15 +2038,68 @@ def lambda_handler(event, context):
                 logger.error('Failed to terminate session: %s', str(e))
     
     # Check for session timeout choice response
-    if session_doc and session_doc.get('context', {}).get('timeout_awaiting_choice'):
+    timeout_awaiting_choice = session_doc and session_doc.get('context', {}).get('timeout_awaiting_choice')
+    
+    if _should_log():
+        logger.info('Checking timeout choice: session_doc_exists=%s, timeout_flag=%s', 
+                    bool(session_doc), timeout_awaiting_choice)
+        if session_doc:
+            context_debug = session_doc.get('context', {})
+            logger.info('Session context keys: %s', list(context_debug.keys()))
+            logger.info('Timeout flag value in context: %s', context_debug.get('timeout_awaiting_choice'))
+    
+    if session_doc and timeout_awaiting_choice:
         message_clean = message.strip().lower()
+
+        # remove timeout_awaiting_choice flag regardless of user input
+        try:
+            client_clear_timeout = _connect_mongo()
+            chats_db = client_clear_timeout['chats']
+            user_coll = chats_db[user_id]
+            user_coll.update_one(
+                {'sessionId': session_id}, 
+                {'$set': {
+                    'context.timeout_awaiting_choice': False  # Clear the flag
+                }}
+            )
+            client_clear_timeout.close()
+        except Exception as e:
+            if _should_log():
+                logger.error('Failed to clear timeout flag: %s', str(e))
         
-        if message_clean in ['continue', 'resume', 'yes', 'y', '1']:
-            # User wants to continue old session - clear timeout flags and resume
+        # Enhanced keyword detection for 'new' - check if 'new' appears anywhere in the message
+        contains_new_keyword = 'new' in message_clean
+        contains_continue_keyword = any(word in message_clean for word in ['continue', 'resume', 'yes'])
+        
+        if _should_log():
+            logger.info('Processing timeout choice: user_message="%s", timeout_awaiting_choice=%s', 
+                        message_clean, timeout_awaiting_choice)
+            logger.info('Enhanced keyword detection: contains_new=%s, contains_continue=%s', 
+                        contains_new_keyword, contains_continue_keyword)
+        
+        if contains_continue_keyword and not contains_new_keyword:
+            # User wants to continue old session - clear timeout flags and return previous message
             try:
                 client_continue = _connect_mongo()
                 chats_db = client_continue['chats']
                 user_coll = chats_db[user_id]
+                
+                # Get the last assistant message from the session
+                current_session = user_coll.find_one({'sessionId': session_id})
+                last_assistant_message = None
+                
+                if current_session and current_session.get('messages'):
+                    # Find the most recent assistant message
+                    messages = current_session.get('messages', [])
+                    for msg in reversed(messages):  # Search from newest to oldest
+                        if msg.get('role') == 'assistant':
+                            # Extract text from content array
+                            content = msg.get('content', [])
+                            if content and isinstance(content, list) and len(content) > 0:
+                                text_content = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
+                                if text_content and not text_content.startswith('ERROR:'):
+                                    last_assistant_message = text_content
+                                    break
                 
                 # Clear timeout flag
                 user_coll.update_one(
@@ -2036,34 +2108,89 @@ def lambda_handler(event, context):
                         'context.timeout_awaiting_choice': ''
                     }}
                 )
-                
-                # Update local session_doc to reflect the cleared flag
-                if session_doc and 'context' in session_doc:
-                    session_doc['context'].pop('timeout_awaiting_choice', None)
-                
-                # Set intent to resume session
-                intent_type = 'resume_session'
+
+                # Also append a short assistant/system message with current timestamp so the
+                # session's last-activity becomes 'now' and the timeout won't re-trigger immediately.
+                try:
+                    new_message_text = last_assistant_message if last_assistant_message else (
+                        "Welcome back! Let's continue where we left off. How can I assist you?"
+                    )
+                    new_msg = {
+                        'role': 'assistant',
+                        'content': [{'text': new_message_text}],
+                        'timestamp': created_at_iso
+                    }
+                    user_coll.update_one({'sessionId': session_id}, {'$push': {'messages': new_msg}})
+                except Exception:
+                    # Non-fatal; if this fails we'll still resume but future timeout logic may fire
+                    if _should_log():
+                        logger.exception('Failed to append resume marker message to session')
                 
                 if _should_log():
-                    logger.info('User chose to continue timeout session: %s, cleared timeout flags', session_id)
+                    logger.info('User chose to continue timeout session: %s, cleared timeout flags, found last message: %s', 
+                                session_id, bool(last_assistant_message))
                 
-                client_continue.close()
+                # Return the previous assistant message directly
+                if last_assistant_message:
+                    resp_body = {
+                        'status': {'statusCode': 200, 'message': 'Success'},
+                        'data': {
+                            'messageId': message_id,
+                            'message': last_assistant_message,
+                            'createdAt': created_at_z,
+                            'sessionId': session_id,
+                            'attachment': attachments,
+                            'intent_type': 'resume_previous_context'
+                        }
+                    }
+                    client_continue.close()
+                    return _cors_response(200, resp_body)
+                else:
+                    # No previous message found, provide a generic continue message
+                    resume_message = (
+                        "Welcome back! Let's continue where we left off. "
+                        "How can I assist you with your government service needs?"
+                    )
+                    
+                    resp_body = {
+                        'status': {'statusCode': 200, 'message': 'Success'},
+                        'data': {
+                            'messageId': message_id,
+                            'message': resume_message,
+                            'createdAt': created_at_z,
+                            'sessionId': session_id,
+                            'attachment': attachments,
+                            'intent_type': 'resume_session_generic'
+                        }
+                    }
+                    client_continue.close()
+                    return _cors_response(200, resp_body)
+                
             except Exception as e:
                 if _should_log():
                     logger.error('Failed to resume timeout session: %s', str(e))
+                # If resume fails, continue with normal processing
+                intent_type = 'resume_session_error'
                     
-        elif message_clean in ['new', 'fresh', 'start', 'no', 'n', '2', 'restart', 'reset']:
+        elif message_clean in ['new', 'fresh', 'start', 'no', 'n', '2', 'restart', 'reset'] or contains_new_keyword:
             # User wants new session - generate new sessionId and return welcome
+            if _should_log():
+                logger.info('User chose NEW session (keyword_match=%s, contains_new=%s), processing new session creation', 
+                            message_clean in ['new', 'fresh', 'start', 'no', 'n', '2', 'restart', 'reset'], contains_new_keyword)
+            
             try:
                 client_new = _connect_mongo()
                 chats_db = client_new['chats']
                 user_coll = chats_db[user_id]
                 
-                # Archive the old session
-                user_coll.update_one(
+                # Archive the old session and clear timeout flag
+                archive_result = user_coll.update_one(
                     {'sessionId': session_id}, 
-                    {'$set': {'status': 'archived'}}
+                    {'$set': {'status': 'archived'}, '$unset': {'context.timeout_awaiting_choice': ''}}
                 )
+                
+                if _should_log():
+                    logger.info('Archived old session %s, matched_count=%d', session_id, archive_result.matched_count)
                 
                 # Generate new session
                 new_session_id = str(uuid.uuid4())
@@ -2078,40 +2205,55 @@ def lambda_handler(event, context):
                     'context': {},
                     'ekyc': ekyc or {}
                 }
-                user_coll.insert_one(new_session_doc)
+                insert_result = user_coll.insert_one(new_session_doc)
                 
                 if _should_log():
-                    logger.info('User chose new session, created: %s', new_session_id)
+                    logger.info('Created new session %s, insert_id=%s', new_session_id, str(insert_result.inserted_id))
                 
-                # Return welcome message with new session ID
-                welcome_message = (
-                    "Welcome back to MyGovHub! 🌟\n\n"
-                    "Starting a fresh conversation. Here, you can easily renew licenses, make bill payments, "
-                    "apply for permits, check your application status, and access official documents. "
-                    "We're here to make your government services seamless and efficient.\n\n"
-                    "How can I help you today?"
+                # Return restart confirmation message
+                restart_message = (
+                    "Perfect! I've started a fresh conversation for you. �\n\n"
+                    "Hi there! I'm your MyGovHub assistant. I can help you with:\n\n"
+                    "• 🆔 **License Renewal** - Renew your driving license\n"
+                    "• 💡 **TNB Bill Payment** - Pay your electricity bills\n"
+                    "• 📄 **Permitting** - Apply for permits\n"
+                    "• 📋 **Application Status** - Check the status of your applications\n\n"
+                    "Just tell me what you need help with, or upload any relevant documents to get started!"
                 )
                 
                 resp_body = {
                     'status': {'statusCode': 200, 'message': 'Success'},
                     'data': {
                         'messageId': message_id,
-                        'message': welcome_message,
+                        'message': restart_message,
                         'createdAt': created_at_z,
-                        'sessionId': new_session_id,
+                        'sessionId': '(session-end)',  # Force client to start completely fresh
                         'attachment': attachments,
-                        'intent_type': 'new_session_after_timeout'
+                        'intent_type': 'session_restart_confirmed'
                     }
                 }
                 
                 client_new.close()
+                
                 return _cors_response(200, resp_body)
                 
             except Exception as e:
                 if _should_log():
                     logger.error('Failed to create new session after timeout: %s', str(e))
+                    logger.exception('Full exception details for new session creation')
+                # If creating new session fails, return an error rather than continuing with old session
+                error_resp_body = {
+                    'status': {'statusCode': 500, 'message': 'Failed to create new session'},
+                    'error': str(e)
+                }
+                return _cors_response(500, error_resp_body)
+        
         else:
-            # Invalid choice - ask again
+            # Invalid choice - ask again (keep timeout_awaiting_choice flag set)
+            if _should_log():
+                logger.info('Invalid timeout choice: message="%s", contains_new=%s, contains_continue=%s', 
+                           message_clean, contains_new_keyword, contains_continue_keyword)
+            
             clarification_message = (
                 "⚠️ **Please Choose an Option**\n\n"
                 "I didn't understand your choice. Please reply:\n\n"
@@ -2131,6 +2273,26 @@ def lambda_handler(event, context):
                 }
             }
             return _cors_response(200, resp_body)
+    
+    if session_doc and not timeout_awaiting_choice:
+        # Ensure timeout_awaiting_choice flag is cleared if it exists but not needed
+        if 'timeout_awaiting_choice' in session_doc.get('context', {}):
+            try:
+                client_clear_flag = _connect_mongo()
+                chats_db = client_clear_flag['chats']
+                user_coll = chats_db[user_id]
+                user_coll.update_one(
+                    {'sessionId': session_id}, 
+                    {'$unset': {
+                        'context.timeout_awaiting_choice': ''
+                    }}
+                )
+                if _should_log():
+                    logger.info('Cleared stale timeout_awaiting_choice flag for session: %s', session_id)
+                client_clear_flag.close()
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to clear stale timeout flag: %s', str(e))
     
     # Order: explicit rejection -> corrections -> affirmation
     # Rejection (needs corrections)
@@ -3159,6 +3321,19 @@ def lambda_handler(event, context):
                     except Exception:
                         pass
                 response_text = run_agent(prompt)
+                
+                # Clean response text to remove unwanted prefixes
+                if response_text:
+                    # Remove common AI response prefixes
+                    prefixes_to_remove = [
+                        'ASSISTANT: ', 'SYSTEM: ', 'USER: ', 'AI: ', 'BOT: ',
+                        'Assistant: ', 'System: ', 'User: ', 'Ai: ', 'Bot: '
+                    ]
+                    for prefix in prefixes_to_remove:
+                        if response_text.startswith(prefix):
+                            response_text = response_text[len(prefix):].strip()
+                            break
+                            
             except Exception as model_exc:
                 # Record the model failure but continue — we'll persist an assistant error message
                 model_error = str(model_exc)
