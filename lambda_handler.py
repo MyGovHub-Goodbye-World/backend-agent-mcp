@@ -383,10 +383,7 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     f"• Current Expiry: {valid_to or 'N/A'}\n"
                     f"• Extension: {duration_years} year{'s' if duration_years > 1 else ''}\n"
                     f"• New Expiry: {new_expiry_str}\n\n"
-                    f"**Payment Summary:**\n"
-                    f"• Duration: {duration_years} year{'s' if duration_years > 1 else ''}\n"
-                    f"• Rate: RM 30.00 per year\n"
-                    f"• **Total Amount: RM {total_cost:.2f}**\n\n"
+                    f"**Total Amount: RM {total_cost:.2f}**\n\n"
                     f"Please confirm to proceed with payment. Reply **YES** to continue or **NO** to cancel. 😊"
                 )
             except Exception:
