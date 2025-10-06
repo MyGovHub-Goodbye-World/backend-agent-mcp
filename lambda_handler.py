@@ -1595,7 +1595,7 @@ def lambda_handler(event, context):
                 # If collection creation fails, it may already exist (race) or be unsupported
                 pass
         coll = db[user_id]
-        # Attempt to fetch existing session document so we can provide history/ekyc to the model
+        # Attempt to fetch existing session document so we can provide history to the model
         session_doc = None
         if session_id and session_id not in ('(new-session)', '(session-end)'):
             try:
@@ -1605,9 +1605,8 @@ def lambda_handler(event, context):
                 if session_doc:
                     status_val = session_doc.get('status')
                     messages_count = len(session_doc.get('messages') or [])
-                    has_ekyc = bool(session_doc.get('ekyc'))
                     if _should_log():
-                        logger.info('Fetched session from MongoDB: user=%s sessionId=%s status=%s messages=%d ekyc=%s', user_id, session_id, status_val, messages_count, has_ekyc)
+                        logger.info('Fetched session from MongoDB: user=%s sessionId=%s status=%s messages=%d', user_id, session_id, status_val, messages_count)
                     
                     # Check session timeout (15 minutes) - skip if already awaiting timeout choice
                     if not session_doc.get('context', {}).get('timeout_awaiting_choice'):
@@ -1736,17 +1735,13 @@ def lambda_handler(event, context):
                 'messages': [],
                 'status': 'active',
                 'service': '',  # service identifier e.g. renew_license, pay_tnb_bill
-                'context': {},
-                'ekyc': ekyc or {}
+                'context': {}
             }
             # Insert the document
             coll.insert_one(session_doc)
 
         else:
-            # existing session: update ekyc if provided
             update_ops = {}
-            if ekyc:
-                update_ops['ekyc'] = ekyc
             if update_ops:
                 coll.update_one({'sessionId': session_id}, {'$set': update_ops})
             # If session_doc exists and is archived, return a restart message and instruct client to start a new session
@@ -2202,8 +2197,7 @@ def lambda_handler(event, context):
                     'messages': [],
                     'status': 'active',
                     'service': '',
-                    'context': {},
-                    'ekyc': ekyc or {}
+                    'context': {}
                 }
                 insert_result = user_coll.insert_one(new_session_doc)
                 
@@ -3234,7 +3228,7 @@ def lambda_handler(event, context):
                 )
                 model_error = None  # No model error since we're bypassing the AI model
             else:
-                # Generic context-building order: 1) Document context summary 2) EKYC 3) Prior messages 4) Current user message
+                # Generic context-building order: 1) Document context summary 2) Prior messages 3) Current user message
                 parts = []
                 # 1. Document/context summary (only high-level; avoid dumping huge raw objects)
                 if session_doc:
@@ -3261,19 +3255,7 @@ def lambda_handler(event, context):
                                     field_snippets.append(f"{f}:{val}")
                             snippet = ', '.join(field_snippets) if field_snippets else 'no key fields'
                             parts.append(f"DOC {key} status={ver_status} {snippet}\n")
-                # 2. EKYC data
-                if session_doc and session_doc.get('ekyc'):
-                    try:
-                        ekyc_str = json.dumps(session_doc.get('ekyc'))
-                    except Exception:
-                        ekyc_str = str(session_doc.get('ekyc'))
-                    parts.append(f"EKYC: {ekyc_str}\n")
-                    if _should_log():
-                        try:
-                            logger.info('Prompt build: included EKYC block size=%d chars', len(ekyc_str))
-                        except Exception:
-                            pass
-                # 3. Prior messages
+                # 2. Prior messages
                 if session_doc and isinstance(session_doc.get('messages'), list):
                     if _should_log():
                         try:
@@ -3289,7 +3271,7 @@ def lambda_handler(event, context):
                                 content_parts.append(str(text))
                         if content_parts:
                             parts.append(f"{role.upper()}: {' '.join(content_parts)}\n")
-                # 4. Current user message
+                # 3. Current user message
                 parts.append(f"USER: {message}\n")
                 prompt = "\n".join(parts)
                 if _should_log():
@@ -3440,8 +3422,7 @@ def lambda_handler(event, context):
                     'messages': [],
                     'status': 'active',
                     'service': '',
-                    'context': {},
-                    'ekyc': {}
+                    'context': {}
                 }
                 coll_continue.insert_one(new_session_doc)
                 
