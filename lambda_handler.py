@@ -1973,19 +1973,81 @@ def lambda_handler(event, context):
             'setuju', 'confirm'
         }
         cleaned = msg.strip().lower()
-        if len(cleaned) <= 15 and cleaned in aff_tokens:
+        
+        # Remove common punctuation for better matching
+        cleaned_no_punct = cleaned.rstrip('.,!?;:')
+        
+        if len(cleaned_no_punct) <= 15 and cleaned_no_punct in aff_tokens:
             return True
-        # Multi-word accept if all tokens in affirmative set
-        if all(t in aff_tokens for t in cleaned.replace('!', '').split()):
+        # Multi-word accept if all tokens in affirmative set (after removing punctuation)
+        tokens = cleaned_no_punct.replace('!', '').split()
+        if all(t in aff_tokens for t in tokens):
             return True
         
         # For unclear cases, use AI as backup (only for longer messages that might be affirmative)
-        if len(cleaned) > 15 and len(cleaned) < 50:
-            ai_intent = _detect_intent_with_ai(msg)
-            if ai_intent == 'affirmative':
+        if len(cleaned) > 5 and len(cleaned) < 50:
+            try:
+                # Create a focused prompt for affirmative detection
+                affirmative_prompt = (
+                    "SYSTEM: You are analyzing user messages to detect affirmative responses. "
+                    "Determine if the message indicates agreement, confirmation, or acceptance.\n\n"
+                    "AFFIRMATIVE INDICATORS:\n"
+                    "- Direct confirmations: 'yes', 'ya', 'ok', 'okay', 'sure', 'correct'\n"
+                    "- Agreement words: 'true', 'benar', 'betul', 'setuju', 'confirm'\n"
+                    "- Positive phrases: 'looks good', 'that's right', 'sounds good'\n"
+                    "- Language variations: 'ya betul', 'okay lah', 'yes please'\n"
+                    "- With punctuation: 'yes.', 'ok!', 'sure?', 'correct.'\n\n"
+                    "NON-AFFIRMATIVE (should return NEGATIVE):\n"
+                    "- Field corrections: 'name is John', 'IC should be 123456', 'address is wrong'\n"
+                    "- Questions: 'what about...', 'how do I...', 'can you...'\n"
+                    "- Negative responses: 'no', 'not correct', 'wrong', 'incorrect'\n"
+                    "- Unclear responses: 'maybe', 'I think', 'not sure'\n\n"
+                    "IMPORTANT RULES:\n"
+                    "- Return 'AFFIRMATIVE' only for clear agreement/confirmation responses\n"
+                    "- Return 'NEGATIVE' for corrections, questions, or disagreements\n"
+                    "- Be conservative - if unsure, return 'NEGATIVE'\n"
+                    "- Ignore punctuation when determining intent\n"
+                    "- Consider context clues and natural language patterns\n"
+                    "- Do not return anything else - just 'AFFIRMATIVE' or 'NEGATIVE'\n\n"
+                    "EXAMPLES:\n"
+                    "- 'yes.' → AFFIRMATIVE\n"
+                    "- 'ok!' → AFFIRMATIVE\n"
+                    "- 'correct, proceed' → AFFIRMATIVE\n"
+                    "- 'ya betul.' → AFFIRMATIVE\n"
+                    "- 'looks good!' → AFFIRMATIVE\n"
+                    "- 'name is John Smith' → NEGATIVE\n"
+                    "- 'IC should be 123456' → NEGATIVE\n"
+                    "- 'what about the address?' → NEGATIVE\n\n"
+                    f"User message: \"{msg.strip()}\"\n\n"
+                    "Classification:"
+                )
+    
+                # Call Bedrock with low temperature for consistent classification
+                ai_response = run_agent(
+                    prompt=affirmative_prompt,
+                    max_tokens=20,
+                    temperature=0.1,  # Very low temperature for consistent classification
+                    top_p=0.7
+                ).strip().upper()
+    
                 if _should_log():
-                    logger.info('AI detected affirmative intent: %s', msg)
-                return True
+                    logger.info('Affirmative detection - Input: "%s", AI Response: "%s"', msg.strip(), ai_response)
+    
+                # Check AI response
+                if 'AFFIRMATIVE' in ai_response:
+                    if _should_log():
+                        logger.info('AI detected affirmative intent: "%s"', msg.strip())
+                    return True
+                else:
+                    if _should_log():
+                        logger.info('AI classified as non-affirmative: "%s"', msg.strip())
+                    return False
+                    
+            except Exception as e:
+                if _should_log():
+                    logger.error('Affirmative detection with Bedrock failed, falling back to keywords: %s', str(e))
+                # Fallback to enhanced keyword matching
+                return cleaned_no_punct in aff_tokens
                 
         return False
 
@@ -1998,27 +2060,90 @@ def lambda_handler(event, context):
         }
         cleaned = msg.strip().lower()
         
-        # Direct match for single words or common phrases
-        if cleaned in neg_tokens:
+        # Remove common punctuation for better matching
+        cleaned_no_punct = cleaned.rstrip('.,!?;:')
+        
+        if len(cleaned_no_punct) <= 15 and cleaned_no_punct in neg_tokens:
+            return True
+        # Multi-word negative if all tokens in negative set (after removing punctuation)
+        tokens = cleaned_no_punct.replace('!', '').split()
+        if all(t in neg_tokens for t in tokens if len(t) > 1):  # Skip single letters
             return True
         
         # Check for phrases that start with negative words
         for neg_word in ['no', 'not', 'cancel', 'stop', 'tidak', 'tak', 'batal']:
-            if cleaned.startswith(f'{neg_word} ') or cleaned == neg_word:
+            if cleaned_no_punct.startswith(f'{neg_word} ') or cleaned_no_punct == neg_word:
                 return True
         
         # Multi-word negative phrases
-        if any(phrase in cleaned for phrase in ['not interested', 'no thanks', 'no thank you', 'tak mahu', 'tak nak']):
+        negative_phrases = ['not interested', 'no thanks', 'no thank you', 'tak mahu', 'tak nak']
+        if any(phrase in cleaned for phrase in negative_phrases):
             return True
         
-        # For unclear cases, use AI as backup
-        if len(cleaned) > 10 and len(cleaned) < 50:
-            ai_intent = _detect_intent_with_ai(msg)
-            if ai_intent == 'negative':
+        # For unclear cases, use AI as backup (only for longer messages that might be negative)
+        if len(cleaned) > 5 and len(cleaned) < 50:
+            try:
+                # Create a focused prompt for negative detection
+                negative_prompt = (
+                    "SYSTEM: You are analyzing user messages to detect negative responses. "
+                    "Determine if the message indicates disagreement, refusal, or rejection.\n\n"
+                    "NEGATIVE INDICATORS:\n"
+                    "- Direct refusals: 'no', 'nope', 'not', 'cancel', 'stop', 'quit'\n"
+                    "- Polite declines: 'no thanks', 'no thank you', 'not interested', 'decline'\n"
+                    "- Malay negatives: 'tidak', 'tak', 'tak mahu', 'tak nak', 'batal'\n"
+                    "- With punctuation: 'no.', 'not!', 'cancel?', 'tidak.'\n\n"
+                    "NON-NEGATIVE (should return POSITIVE):\n"
+                    "- Affirmative responses: 'yes', 'ok', 'sure', 'correct'\n"
+                    "- Field corrections: 'name is John', 'IC should be 123456'\n"
+                    "- Questions: 'what about...', 'how do I...', 'can you...'\n"
+                    "- Neutral responses: 'maybe', 'I think', 'not sure about that'\n\n"
+                    "IMPORTANT RULES:\n"
+                    "- Return 'NEGATIVE' only for clear refusal/disagreement responses\n"
+                    "- Return 'POSITIVE' for affirmations, questions, corrections, or neutral content\n"
+                    "- Be conservative - if unsure, return 'POSITIVE'\n"
+                    "- Ignore punctuation when determining intent\n"
+                    "- Consider context clues and natural language patterns\n"
+                    "- Do not return anything else - just 'NEGATIVE' or 'POSITIVE'\n\n"
+                    "EXAMPLES:\n"
+                    "- 'no.' → NEGATIVE\n"
+                    "- 'not interested!' → NEGATIVE\n"
+                    "- 'cancel this' → NEGATIVE\n"
+                    "- 'tidak.' → NEGATIVE\n"
+                    "- 'tak mahu' → NEGATIVE\n"
+                    "- 'yes please' → POSITIVE\n"
+                    "- 'name is John Smith' → POSITIVE\n"
+                    "- 'what about payment?' → POSITIVE\n\n"
+                    f"User message: \"{msg.strip()}\"\n\n"
+                    "Classification:"
+                )
+
+                # Call Bedrock with low temperature for consistent classification
+                ai_response = run_agent(
+                    prompt=negative_prompt,
+                    max_tokens=20,
+                    temperature=0.1,  # Very low temperature for consistent classification
+                    top_p=0.7
+                ).strip().upper()
+
                 if _should_log():
-                    logger.info('AI detected negative intent: %s', msg)
-                return True
-            
+                    logger.info('Negative detection - Input: "%s", AI Response: "%s"', msg.strip(), ai_response)
+
+                # Check AI response
+                if 'NEGATIVE' in ai_response:
+                    if _should_log():
+                        logger.info('AI detected negative intent: "%s"', msg.strip())
+                    return True
+                else:
+                    if _should_log():
+                        logger.info('AI classified as non-negative: "%s"', msg.strip())
+                    return False
+                    
+            except Exception as e:
+                if _should_log():
+                    logger.error('Negative detection with Bedrock failed, falling back to keywords: %s', str(e))
+                # Fallback to enhanced keyword matching
+                return cleaned_no_punct in neg_tokens
+                
         return False
 
     def _is_document_rejection(msg: str) -> bool:
