@@ -2913,6 +2913,34 @@ def lambda_handler(event, context):
                         except Exception as refresh_error:
                             if _should_log():
                                 logger.error('Failed to refresh session document: %s', str(refresh_error))
+                    elif detected_category in ['license', 'license-front', 'license-back']:
+                        # Set license renewal service after verification
+                        service_update_result = coll_verify.update_one(
+                            {'sessionId': session_to_verify}, 
+                            {'$set': {'service': 'renew_license'}}
+                        )
+                        
+                        # Update local variable
+                        current_active_service = 'renew_license'
+                        
+                        if _should_log():
+                            logger.info('Auto-set service to renew_license after license document verification. Category: %s, Updated: %d documents', 
+                                      detected_category, service_update_result.modified_count)
+                        
+                        # Refresh session_doc to include the updated service
+                        try:
+                            refreshed_session = coll_verify.find_one({'sessionId': session_to_verify})
+                            if refreshed_session:
+                                session_doc = refreshed_session
+                                if _should_log():
+                                    logger.info('Session document refreshed after license service auto-detection')
+                        except Exception as refresh_error:
+                            if _should_log():
+                                logger.error('Failed to refresh session document after license auto-detection: %s', str(refresh_error))
+                    elif detected_category == 'idcard':
+                        # For ID card, don't auto-set service, but log for special handling
+                        if _should_log():
+                            logger.info('ID card document verified. Category: %s - Will prompt user for service selection', detected_category)
                     else:
                         if _should_log():
                             logger.info('Document category "%s" does not match TNB, no auto-service set', detected_category)
@@ -2956,6 +2984,37 @@ def lambda_handler(event, context):
                                         if _should_log():
                                             logger.error('Failed to refresh session document in alternative: %s', str(refresh_error))
                                     break
+                                elif detected_category in ['license', 'license-front', 'license-back'] and is_verified:
+                                    # Set license renewal service after verification
+                                    service_update_result = coll_verify.update_one(
+                                        {'sessionId': session_to_verify}, 
+                                        {'$set': {'service': 'renew_license'}}
+                                    )
+                                    
+                                    # Update local variable
+                                    current_active_service = 'renew_license'
+                                    
+                                    if _should_log():
+                                        logger.info('ALTERNATIVE: Auto-set service to renew_license after license document verification. Doc: %s, Category: %s, Updated: %d documents', 
+                                                  doc_key, detected_category, service_update_result.modified_count)
+                                    
+                                    # Refresh session_doc to include the updated service
+                                    try:
+                                        refreshed_session = coll_verify.find_one({'sessionId': session_to_verify})
+                                        if refreshed_session:
+                                            session_doc = refreshed_session
+                                            if _should_log():
+                                                logger.info('Session document refreshed after license service auto-detection')
+                                    except Exception as refresh_error:
+                                        if _should_log():
+                                            logger.error('Failed to refresh session document after license auto-detection: %s', str(refresh_error))
+                                    break
+                                elif detected_category == 'idcard' and is_verified:
+                                    # For ID card, don't auto-set service, but log for special handling
+                                    if _should_log():
+                                        logger.info('ID card document verified. Doc: %s, Category: %s - Will prompt user for service selection', 
+                                                  doc_key, detected_category)
+                                    # Don't break here, continue checking other documents
             else:
                 if _should_log():
                     logger.info('Active service already exists: %s, skipping auto-detection', current_active_service)
@@ -3841,16 +3900,29 @@ def lambda_handler(event, context):
                             "I can help you pay this electricity bill right away. Would you like me to "
                             "proceed with the TNB bill payment process? Just reply YES to continue.'"
                         )
-                    elif detected_category in ('idcard', 'license', 'license-front', 'license-back'):
+                    elif detected_category in ('license', 'license-front', 'license-back'):
                         prompt = (
-                            "SYSTEM: The user has verified their ID card or license document. "
+                            "SYSTEM: The user has verified their driving license document. "
                             "Provide a brief acknowledgment and specifically suggest license renewal service. "
                             "Keep it helpful and concise.\n\n"
                             f"User message: {message}\n\n"
-                            "Respond with: 'Thank you for verifying your document information! "
-                            "I can help you renew your driving license. Would you like me to "
+                            "Respond with: 'Thank you for verifying your license information! "
+                            "I can help you renew your driving license right away. Would you like me to "
                             "proceed with the license renewal process? Just reply YES to continue.'"
                         )
+                    elif detected_category == 'idcard':
+                        # For ID card, prompt user to choose what service they need
+                        response_text = (
+                            "Thank you for verifying your ID card information! I can help you with various government services:\n\n"
+                            "🔄 **Renew driving license** - Type: \"renew license\" or \"license renewal\"\n"
+                            "💡 **Pay TNB electricity bill** - Type: \"pay TNB bill\" or \"TNB payment\"\n"
+                            "📄 **Apply for permits** - Type: \"apply permit\"\n"
+                            "📋 **Check application status** - Type: \"check status\"\n"
+                            "📁 **Access official documents** - Type: \"get documents\"\n\n"
+                            "What would you like to do today?"
+                        )
+                        # Skip AI model call for this direct message
+                        model_error = None
                     else:
                         # Generic fallback for unknown categories
                         prompt = (
