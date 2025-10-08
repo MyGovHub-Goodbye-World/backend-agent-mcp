@@ -1982,9 +1982,16 @@ def lambda_handler(event, context):
     # Handle verification responses
     message_lower = message.lower().strip()
     
+    if _should_log():
+        logger.info('VERIFICATION DEBUG - message: "%s", message_lower: "%s", unverified_doc_key: %s', 
+                   message, message_lower, unverified_doc_key)
+    
     def _has_field_pattern(msg: str) -> bool:
         field_synonyms = ['name', 'full name', 'ic', 'ic number', 'gender', 'address', 'license', 'account', 'invoice']
-        return any(f" {syn} " in msg or msg.startswith(f"{syn} ") for syn in field_synonyms)
+        result = any(f" {syn} " in msg or msg.startswith(f"{syn} ") for syn in field_synonyms)
+        if _should_log():
+            logger.info('VERIFICATION DEBUG - _has_field_pattern("%s") = %s', msg, result)
+        return result
 
     def _is_affirmative(msg: str) -> bool:
         # Accept short pure confirmations only; reject if appears to contain field corrections
@@ -1997,6 +2004,10 @@ def lambda_handler(event, context):
         
         # Remove common punctuation for better matching
         cleaned_no_punct = cleaned.rstrip('.,!?;:')
+        
+        if _should_log():
+            logger.info('VERIFICATION DEBUG - _is_affirmative("%s") cleaned="%s", in_tokens=%s', 
+                       msg, cleaned_no_punct, cleaned_no_punct in aff_tokens)
         
         if len(cleaned_no_punct) <= 15 and cleaned_no_punct in aff_tokens:
             return True
@@ -2823,6 +2834,9 @@ def lambda_handler(event, context):
         elif _is_affirmative(message_lower) and not _has_field_pattern(f' {message_lower} '):
             intent_type = 'document_verified'
             verification_status = 'confirmed'
+            if _should_log():
+                logger.info('VERIFICATION DEBUG - Document verified! message_lower="%s", intent_type="%s"', 
+                           message_lower, intent_type)
     # Legacy path (affirmation first) kept for cases without document
     elif _is_affirmative(message) and not _is_document_rejection(message):
         if unverified_doc_key:
@@ -2847,6 +2861,104 @@ def lambda_handler(event, context):
             coll_verify.update_one({'sessionId': session_to_verify}, update_doc)
             if _should_log():
                 logger.info('Document verified and corrections merged (status updated): %s merged_fields=%s', unverified_doc_key, list(pending_corr.keys()))
+            
+            # Auto-detect service based on document category after verification
+            # Get current active service from the session
+            session_for_service_check = coll_verify.find_one({'sessionId': session_to_verify})
+            current_active_service = session_for_service_check.get('service') if session_for_service_check else ''
+            
+            if _should_log():
+                logger.info('Auto-detection check: current_active_service=%s, unverified_doc_key=%s', current_active_service, unverified_doc_key)
+            
+            if not current_active_service:
+                if _should_log():
+                    logger.info('No active service, checking document category for auto-detection')
+                # Get the verified document to check its category
+                updated_doc = coll_verify.find_one({'sessionId': session_to_verify})
+                if _should_log():
+                    logger.info('Auto-detection: updated_doc exists=%s, unverified_doc_key=%s', bool(updated_doc), unverified_doc_key)
+                    if updated_doc and updated_doc.get('context'):
+                        logger.info('Available context keys: %s', list(updated_doc.get('context', {}).keys()))
+                
+                if updated_doc and updated_doc.get('context', {}).get(unverified_doc_key):
+                    verified_doc_data = updated_doc['context'][unverified_doc_key]
+                    category_detection = verified_doc_data.get('categoryDetection', {})
+                    detected_category = category_detection.get('detected_category', '').lower()
+                    
+                    if _should_log():
+                        logger.info('Document verification - unverified_doc_key: %s, detected_category: %s', 
+                                  unverified_doc_key, detected_category)
+                    
+                    if detected_category == 'tnb':
+                        # Set TNB bill payment service after verification
+                        service_update_result = coll_verify.update_one(
+                            {'sessionId': session_to_verify}, 
+                            {'$set': {'service': 'pay_tnb_bill'}}
+                        )
+                        
+                        # Update local variable
+                        current_active_service = 'pay_tnb_bill'
+                        
+                        if _should_log():
+                            logger.info('Auto-set service to pay_tnb_bill after TNB document verification. Updated: %d documents', 
+                                      service_update_result.modified_count)
+                        
+                        # Refresh session_doc to include the updated service
+                        try:
+                            refreshed_session = coll_verify.find_one({'sessionId': session_to_verify})
+                            if refreshed_session:
+                                session_doc = refreshed_session
+                                if _should_log():
+                                    logger.info('Session document refreshed after service auto-detection')
+                        except Exception as refresh_error:
+                            if _should_log():
+                                logger.error('Failed to refresh session document: %s', str(refresh_error))
+                    else:
+                        if _should_log():
+                            logger.info('Document category "%s" does not match TNB, no auto-service set', detected_category)
+                else:
+                    if _should_log():
+                        logger.info('Document not found or context missing for auto-detection with unverified_doc_key')
+                    
+                    # Alternative: check all documents in context for TNB category (verified or unverified)
+                    if updated_doc and updated_doc.get('context'):
+                        for doc_key, doc_data in updated_doc['context'].items():
+                            if isinstance(doc_data, dict) and doc_data.get('categoryDetection'):
+                                category_detection = doc_data.get('categoryDetection', {})
+                                detected_category = category_detection.get('detected_category', '').lower()
+                                is_verified = doc_data.get('isVerified') == 'verified'
+                                
+                                if _should_log():
+                                    logger.info('Checking doc %s: category=%s, is_verified=%s', doc_key, detected_category, is_verified)
+                                
+                                if detected_category == 'tnb' and is_verified:
+                                    # Set TNB bill payment service after verification
+                                    service_update_result = coll_verify.update_one(
+                                        {'sessionId': session_to_verify}, 
+                                        {'$set': {'service': 'pay_tnb_bill'}}
+                                    )
+                                    
+                                    # Update local variable
+                                    current_active_service = 'pay_tnb_bill'
+                                    
+                                    if _should_log():
+                                        logger.info('ALTERNATIVE: Auto-set service to pay_tnb_bill after TNB document verification. Doc: %s, Updated: %d documents', 
+                                                  doc_key, service_update_result.modified_count)
+                                    
+                                    # Refresh session_doc to include the updated service
+                                    try:
+                                        refreshed_session = coll_verify.find_one({'sessionId': session_to_verify})
+                                        if refreshed_session:
+                                            session_doc = refreshed_session
+                                            if _should_log():
+                                                logger.info('Session document refreshed after alternative service auto-detection')
+                                    except Exception as refresh_error:
+                                        if _should_log():
+                                            logger.error('Failed to refresh session document in alternative: %s', str(refresh_error))
+                                    break
+            else:
+                if _should_log():
+                    logger.info('Active service already exists: %s, skipping auto-detection', current_active_service)
         except Exception as e:
             if _should_log():
                 logger.error('Failed to update document verification status: %s', str(e))
@@ -3565,6 +3677,12 @@ def lambda_handler(event, context):
                     logger.info('Document processed successfully. Category: %s, Intent type: %s', 
                                 detected_category, intent_type)
 
+    # Re-check service readiness if service was set during verification
+    if active_service and not service_ready:
+        service_ready = _service_requirements_met(active_service, session_doc, ekyc)
+        if _should_log():
+            logger.info('Re-checked service readiness: service=%s ready=%s', active_service, service_ready)
+
     # Determine prompt for Bedrock.
     try:
         # If a service is active and requirements are met, bypass model with deterministic next-step prompt
@@ -3653,6 +3771,19 @@ def lambda_handler(event, context):
                     )
                     # Skip AI model call for this direct message
                     model_error = None
+            elif intent_type == 'document_processing' and ocr_result:
+                # Use document analysis prompt for processed documents (higher priority than session conditions)
+                if _should_log():
+                    logger.info('Using document analysis prompt for document processing')
+                prompt = _generate_document_analysis_prompt(ocr_result, message)
+            elif intent_type == 'document_processing':
+                # Document processing without OCR result - this shouldn't happen but let's log it
+                if _should_log():
+                    logger.warning('Document processing intent but no OCR result available')
+                prompt = (
+                    "SYSTEM: A document was uploaded but processing failed. "
+                    "Provide a helpful message asking the user to try uploading the document again."
+                )
             elif session_id == '(new-session)':
                 # For first-time connection without service intent, request a welcome message
                 prompt = (
@@ -3688,9 +3819,6 @@ def lambda_handler(event, context):
                     "What would you like to do next?"
                 )
                 model_error = None  # No model error since we're bypassing the AI model
-            elif intent_type == 'document_processing' and ocr_result:
-                # Use document analysis prompt for processed documents
-                prompt = _generate_document_analysis_prompt(ocr_result, message)
             elif intent_type == 'document_verified':
                 # Document verified - provide category-specific suggestions if no active service
                 if not active_service:
@@ -3903,52 +4031,83 @@ def lambda_handler(event, context):
                 )
                 model_error = None  # No model error since we're bypassing the AI model
             else:
-                # Generic context-building order: 1) Document context summary 2) Prior messages 3) Current user message
-                parts = []
-                # 1. Document/context summary (only high-level; avoid dumping huge raw objects)
-                if session_doc:
-                    ctx = session_doc.get('context') or {}
-                    if ctx:
-                        # Summarize each document entry: ref + verification + key fields
+                # Check if user needs to be prompted for service selection
+                if not active_service and not attachments and message.strip() and not session_id.startswith('('):
+                    # No active service, no document upload, and user sent a message
+                    # Check if message contains service intent that wasn't detected
+                    service_intent = _detect_service_intent(message)
+                    
+                    if not service_intent:
+                        # No service detected - prompt user to select a service
+                        if _should_log():
+                            logger.info('No active service and no service intent detected, prompting for service selection')
+                        
+                        response_text = (
+                            "I'd be happy to help you! Please let me know what you'd like to do:\n\n"
+                            "🔄 **Renew driving license** - Type: \"renew license\" or \"license renewal\"\n"
+                            "💡 **Pay TNB electricity bill** - Type: \"pay TNB bill\" or \"TNB payment\"\n"
+                            "📄 **Apply for permits** - Type: \"apply permit\"\n"
+                            "📋 **Check application status** - Type: \"check status\"\n"
+                            "📁 **Access official documents** - Type: \"get documents\"\n\n"
+                            "You can also upload a document directly, and I'll automatically detect what service you need!\n\n"
+                            "What would you like to do today?"
+                        )
+                        model_error = None  # No model error since we're bypassing the AI model
+                        
+                        # Skip the generic prompt building below
+                        parts = None
+                    else:
+                        # Service intent was detected but not processed - let it fall through to generic handling
+                        parts = []
+                else:
+                    # Generic context-building order: 1) Document context summary 2) Prior messages 3) Current user message
+                    parts = []
+                # Only build generic prompt if parts is not None (i.e., we haven't set a direct response)
+                if parts is not None:
+                    # 1. Document/context summary (only high-level; avoid dumping huge raw objects)
+                    if session_doc:
+                        ctx = session_doc.get('context') or {}
+                        if ctx:
+                            # Summarize each document entry: ref + verification + key fields
+                            if _should_log():
+                                try:
+                                    logger.info('Prompt build: summarizing %d context entries', len(ctx))
+                                except Exception:
+                                    pass
+                            for key, doc_meta in list(ctx.items())[:5]:  # limit to first 5 to keep prompt small
+                                if not key.startswith('document_'):
+                                    continue
+                                ver_status = doc_meta.get('isVerified')
+                                extracted = doc_meta.get('extractedData') or {}
+                                # show only a few stable fields
+                                field_snippets = []
+                                for f in ['full_name', 'userId', 'licenses_number', 'account_number', 'invoice_number']:
+                                    if f in extracted:
+                                        val = str(extracted.get(f))
+                                        if len(val) > 40:
+                                            val = val[:37] + '...'
+                                        field_snippets.append(f"{f}:{val}")
+                                snippet = ', '.join(field_snippets) if field_snippets else 'no key fields'
+                                parts.append(f"DOC {key} status={ver_status} {snippet}\n")
+                    # 2. Prior messages
+                    if session_doc and isinstance(session_doc.get('messages'), list):
                         if _should_log():
                             try:
-                                logger.info('Prompt build: summarizing %d context entries', len(ctx))
+                                logger.info('Prompt build: iterating %d prior messages', len(session_doc.get('messages')))
                             except Exception:
                                 pass
-                        for key, doc_meta in list(ctx.items())[:5]:  # limit to first 5 to keep prompt small
-                            if not key.startswith('document_'):
-                                continue
-                            ver_status = doc_meta.get('isVerified')
-                            extracted = doc_meta.get('extractedData') or {}
-                            # show only a few stable fields
-                            field_snippets = []
-                            for f in ['full_name', 'userId', 'licenses_number', 'account_number', 'invoice_number']:
-                                if f in extracted:
-                                    val = str(extracted.get(f))
-                                    if len(val) > 40:
-                                        val = val[:37] + '...'
-                                    field_snippets.append(f"{f}:{val}")
-                            snippet = ', '.join(field_snippets) if field_snippets else 'no key fields'
-                            parts.append(f"DOC {key} status={ver_status} {snippet}\n")
-                # 2. Prior messages
-                if session_doc and isinstance(session_doc.get('messages'), list):
-                    if _should_log():
-                        try:
-                            logger.info('Prompt build: iterating %d prior messages', len(session_doc.get('messages')))
-                        except Exception:
-                            pass
-                    for m in session_doc.get('messages'):
-                        role = m.get('role', 'user')
-                        content_parts = []
-                        for c in m.get('content', []):
-                            text = c.get('text') if isinstance(c, dict) else str(c)
-                            if text:
-                                content_parts.append(str(text))
-                        if content_parts:
-                            parts.append(f"{role.upper()}: {' '.join(content_parts)}\n")
-                # 3. Current user message
-                parts.append(f"USER: {message}\n")
-                prompt = "\n".join(parts)
+                        for m in session_doc.get('messages'):
+                            role = m.get('role', 'user')
+                            content_parts = []
+                            for c in m.get('content', []):
+                                text = c.get('text') if isinstance(c, dict) else str(c)
+                                if text:
+                                    content_parts.append(str(text))
+                            if content_parts:
+                                parts.append(f"{role.upper()}: {' '.join(content_parts)}\n")
+                    # 3. Current user message
+                    parts.append(f"USER: {message}\n")
+                    prompt = "\n".join(parts)
                 if _should_log():
                     try:
                         logger.info('Prompt build complete: length=%d chars', len(prompt))
