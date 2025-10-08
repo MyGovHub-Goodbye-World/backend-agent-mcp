@@ -1833,11 +1833,92 @@ def lambda_handler(event, context):
     ocr_result = None
     intent_type = None
     
-    # Check for transcription failure from Layer 1
-    if message and message.strip() == 'Transcription failed.':
-        intent_type = 'transcription_failed'
-        if _should_log():
-            logger.info('Detected transcription failure from Layer 1')
+    # Check for transcription failure from Layer 1 using Bedrock AI
+    if message and message.strip():
+        try:
+            # Create a focused prompt for transcription failure detection
+            transcription_failure_prompt = (
+                "SYSTEM: You are analyzing messages from a speech-to-text transcription service. "
+                "Determine if the message indicates a transcription failure or error.\n\n"
+                "TRANSCRIPTION FAILURE INDICATORS:\n"
+                "- Direct failure messages: 'Transcription failed', 'Speech recognition error', 'Audio processing failed'\n"
+                "- Partial failures: 'Transcription completed but text retrieval failed', 'Audio unclear', 'Could not process audio'\n"
+                "- Technical errors: 'Service unavailable', 'Timeout error', 'Processing error', 'Audio format not supported'\n"
+                "- Quality issues: 'Audio too quiet', 'Background noise too high', 'Speech not detected'\n"
+                "- Language variations: 'Transkripsi gagal', 'Error de transcripción', 'Échec de transcription'\n\n"
+                "NORMAL MESSAGES (NOT failures):\n"
+                "- Regular user text: 'Hello', 'I need help', 'Can you assist me'\n"
+                "- Questions: 'What services do you offer?', 'How can I renew my license?'\n"
+                "- Commands: 'Show me my bills', 'I want to pay'\n"
+                "- Responses: 'Yes', 'No', 'Thank you'\n\n"
+                "IMPORTANT RULES:\n"
+                "- Only return 'TRANSCRIPTION_FAILED' if the message clearly indicates a transcription/speech processing error\n"
+                "- Return 'NORMAL_MESSAGE' for regular user communication\n"
+                "- Be conservative - if unsure, return 'NORMAL_MESSAGE'\n"
+                "- Consider context clues and technical terminology\n"
+                "- Handle multiple languages (English, Malay, etc.)\n"
+                "- Do not return anything else - just the classification\n\n"
+                "EXAMPLES:\n"
+                "- 'Transcription failed.' → TRANSCRIPTION_FAILED\n"
+                "- 'Transcription completed but text retrieval failed.' → TRANSCRIPTION_FAILED\n"
+                "- 'Audio processing error' → TRANSCRIPTION_FAILED\n"
+                "- 'Speech not detected' → TRANSCRIPTION_FAILED\n"
+                "- 'Hello, I need help' → NORMAL_MESSAGE\n"
+                "- 'Can you help me renew my license?' → NORMAL_MESSAGE\n\n"
+                f"Message to analyze: \"{message.strip()}\"\n\n"
+                "Classification:"
+            )
+
+            # Call Bedrock with low temperature for consistent classification
+            ai_response = run_agent(
+                prompt=transcription_failure_prompt,
+                max_tokens=30,
+                temperature=0.1,  # Very low temperature for consistent classification
+                top_p=0.7
+            ).strip().upper()
+
+            if _should_log():
+                logger.info('Transcription failure detection - Input: "%s", AI Response: "%s"', message.strip(), ai_response)
+
+            # Check AI response
+            if 'TRANSCRIPTION_FAILED' in ai_response:
+                intent_type = 'transcription_failed'
+                if _should_log():
+                    logger.info('Detected transcription failure via Bedrock AI: "%s"', message.strip())
+            elif 'NORMAL_MESSAGE' in ai_response:
+                # Not a transcription failure, continue with normal processing
+                if _should_log():
+                    logger.info('Message classified as normal (not transcription failure): "%s"', message.strip())
+            else:
+                # Unexpected AI response, log and fallback to keyword detection
+                if _should_log():
+                    logger.warning('Unexpected AI response for transcription failure detection: "%s", falling back to keywords', ai_response)
+                
+                # Fallback to exact string matching for known failure messages
+                failure_messages = [
+                    'Transcription failed.',
+                    'Transcription completed but text retrieval failed.',
+                    'Speech recognition error',
+                    'Audio processing failed',
+                    'Could not process audio',
+                    'Transcription service unavailable'
+                ]
+                
+                if any(msg.lower() in message.strip().lower() for msg in failure_messages):
+                    intent_type = 'transcription_failed'
+                    if _should_log():
+                        logger.info('Detected transcription failure via fallback keywords: "%s"', message.strip())
+
+        except Exception as e:
+            # Fallback to simple string matching if Bedrock fails
+            if _should_log():
+                logger.error('Transcription failure detection with Bedrock failed, falling back to exact matching: %s', str(e))
+            
+            # Original exact matching as ultimate fallback
+            if message.strip() == 'Transcription failed.' or message.strip() == 'Transcription completed but text retrieval failed.':
+                intent_type = 'transcription_failed'
+                if _should_log():
+                    logger.info('Detected transcription failure via exact string matching: "%s"', message.strip())
     
     # Check document verification status and handle user responses
     verification_status = None
