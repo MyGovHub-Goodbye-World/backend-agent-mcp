@@ -3471,8 +3471,8 @@ def lambda_handler(event, context):
                     category_detection = ocr_result.get('category_detection', {}) or {}
                     detected_category = (category_detection.get('detected_category') or '').lower()
                     extracted_data = ocr_result.get('extracted_data', {}) or {}
-                    extracted_ic = extracted_data.get('userId') or extracted_data.get('ic_number') or extracted_data.get('ic')
-                    if detected_category in ('identification', 'idcard', 'id_card', 'identity', 'identity_card') and extracted_ic:
+                    extracted_ic = extracted_data.get('userId')
+                    if detected_category == 'idcard' and extracted_ic:
                         norm_uploaded = _normalize_ic(extracted_ic)
                         norm_user = _normalize_ic(user_id)
                         if norm_uploaded and norm_user and norm_uploaded != norm_user:
