@@ -2820,35 +2820,100 @@ def lambda_handler(event, context):
             pass
         
         if current_workflow_state == 'asking_duration':
-            # Try to parse duration from user message - accept both digits and word numbers
-            import re
-            message_clean = message.strip().lower()
-            
-            # Word-to-number mapping (English and Malay)
-            word_to_number = {
-                'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
-                'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
-                'satu': 1, 'dua': 2, 'tiga': 3, 'empat': 4, 'lima': 5,
-                'enam': 6, 'tujuh': 7, 'lapan': 8, 'sembilan': 9, 'sepuluh': 10
-            }
-            
+            # Use Bedrock AI to intelligently parse duration from user message
             years = None
             
-            # Try parsing as pure digit first
-            duration_match = re.match(r'^\s*(\d{1,2})\s*$', message.strip())
-            if duration_match:
-                years = int(duration_match.group(1))
-            else:
-                # Try parsing as word number (with optional "years"/"tahun")
-                # Remove common suffixes like "years", "year", "tahun"
-                cleaned_message = re.sub(r'\b(years?|tahun)\b', '', message_clean).strip()
+            try:
+                # Create a focused prompt for duration extraction
+                duration_prompt = (
+                    "SYSTEM: You are parsing license renewal duration from user messages. "
+                    "Extract the number of years the user wants to renew their license for.\n\n"
+                    "VALID INPUTS:\n"
+                    "- Numbers: '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'\n"
+                    "- Written numbers (English): 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'\n"
+                    "- Written numbers (Malay): 'satu', 'dua', 'tiga', 'empat', 'lima', 'enam', 'tujuh', 'lapan', 'sembilan', 'sepuluh'\n"
+                    "- With units: '3 years', '5 tahun', 'two years', 'lima tahun'\n"
+                    "- Natural language: 'I want 3 years', 'Renew for 5 years', 'Make it 2 years please'\n"
+                    "- Mixed: '3 years please', 'satu tahun saja', 'just 2', 'only five'\n\n"
+                    "INVALID INPUTS:\n"
+                    "- Out of range: '0', '11', '15', '20', 'zero', 'eleven'\n"
+                    "- Non-duration: 'yes', 'no', 'help', 'I don't know', 'maybe'\n"
+                    "- Unclear: 'a few', 'some', 'many', 'not sure'\n\n"
+                    "INSTRUCTIONS:\n"
+                    "- Only return a single number from 1 to 10 if you can clearly identify the duration\n"
+                    "- Return 'INVALID' if the input is unclear, out of range, or not a duration\n"
+                    "- Return 'INVALID' if you're unsure about the user's intent\n"
+                    "- Be conservative - when in doubt, return 'INVALID'\n"
+                    "- Do not return anything else - just the number or 'INVALID'\n\n"
+                    "EXAMPLES:\n"
+                    "- '3' → 3\n"
+                    "- 'five years' → 5\n"
+                    "- 'tiga tahun' → 3\n"
+                    "- 'I want to renew for 2 years' → 2\n"
+                    "- '7 years please' → 7\n"
+                    "- 'sepuluh' → 10\n"
+                    "- 'yes' → INVALID\n"
+                    "- '15 years' → INVALID\n"
+                    "- 'I don't know' → INVALID\n"
+                    "- 'a few years' → INVALID\n\n"
+                    f"User message: \"{message.strip()}\"\n\n"
+                    "Duration (1-10 or INVALID):"
+                )
+
+                # Call Bedrock with low temperature for consistent parsing
+                ai_response = run_agent(
+                    prompt=duration_prompt,
+                    max_tokens=20,
+                    temperature=0.1,  # Very low temperature for consistent parsing
+                    top_p=0.7
+                ).strip()
+
+                if _should_log():
+                    logger.info('Duration parsing - Input: "%s", AI Response: "%s"', message.strip(), ai_response)
+
+                # Parse AI response
+                if ai_response.upper() == 'INVALID':
+                    years = None
+                    if _should_log():
+                        logger.info('AI classified duration as invalid: "%s"', message.strip())
+                else:
+                    try:
+                        # Try to extract number from AI response
+                        years_candidate = int(ai_response)
+                        if 1 <= years_candidate <= 10:
+                            years = years_candidate
+                            if _should_log():
+                                logger.info('AI successfully parsed duration: %d years from "%s"', years, message.strip())
+                        else:
+                            years = None
+                            if _should_log():
+                                logger.warning('AI returned out-of-range duration: %d from "%s"', years_candidate, message.strip())
+                    except (ValueError, TypeError):
+                        years = None
+                        if _should_log():
+                            logger.warning('AI returned non-numeric duration: "%s" from "%s"', ai_response, message.strip())
+
+            except Exception as e:
+                # Fallback to simple regex parsing if Bedrock fails
+                if _should_log():
+                    logger.error('Duration parsing with Bedrock failed, falling back to regex: %s', str(e))
                 
-                # Check for exact word number match
-                if cleaned_message in word_to_number:
-                    years = word_to_number[cleaned_message]
+                import re
+                # Simple fallback - extract first number from message
+                duration_match = re.search(r'\b(\d{1,2})\b', message.strip())
+                if duration_match:
+                    try:
+                        years_candidate = int(duration_match.group(1))
+                        if 1 <= years_candidate <= 10:
+                            years = years_candidate
+                            if _should_log():
+                                logger.info('Fallback regex parsed duration: %d years', years)
+                    except ValueError:
+                        pass
             
+            # Process the parsed duration
             if years is not None:
-                if 1 <= years <= 10:  # Valid range
+                if 1 <= years <= 10:  # Valid range (double-check)
                     renew_fee_per_year = 30.00
                     renew_fee = years * renew_fee_per_year
                     
@@ -2879,12 +2944,14 @@ def lambda_handler(event, context):
                         if _should_log():
                             logger.error('Failed to store duration selection: %s', str(e))
                 else:
+                    # This shouldn't happen with AI parsing, but safety check
                     if _should_log():
-                        logger.info('Invalid duration provided: %d (must be 1-10)', years)
+                        logger.warning('Invalid duration range after parsing: %d (must be 1-10)', years)
+                    intent_type = 'invalid_duration_format'
             else:
-                # Invalid input format (contains words, letters, or non-numeric input)
+                # AI couldn't parse a valid duration from the message
                 if _should_log():
-                    logger.info('Invalid duration format provided: "%s" (must be a number 1-10)', message.strip())
+                    logger.info('No valid duration found in message: "%s"', message.strip())
                 # Set intent to ask for valid numeric input
                 intent_type = 'invalid_duration_format'
 
