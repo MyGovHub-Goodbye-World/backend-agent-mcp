@@ -743,7 +743,7 @@ def _detect_service_intent(message_lower: str):
 
     # Driving license renewal
     if any(k in message_lower for k in ['renew', 'renewal', 'renewing']) and \
-       any(k in message_lower for k in ['license', 'driving license', 'lesen', 'driver license']):
+       any(k in message_lower for k in ['license', 'driving license', 'lesen', 'driver license', 'license']):
         return 'renew_license'
 
     # TNB bill payment (Tenaga Nasional Berhad - Malaysia electric utility)
@@ -1771,6 +1771,12 @@ def lambda_handler(event, context):
     ocr_result = None
     intent_type = None
     
+    # Check for transcription failure from Layer 1
+    if message and message.strip() == 'Transcription failed.':
+        intent_type = 'transcription_failed'
+        if _should_log():
+            logger.info('Detected transcription failure from Layer 1')
+    
     # Check document verification status and handle user responses
     verification_status = None
     unverified_doc_key = None
@@ -2031,6 +2037,105 @@ def lambda_handler(event, context):
         except Exception as e:
             if _should_log():
                 logger.error('Failed to terminate session: %s', str(e))
+    
+    # Handle transcription failure from Layer 1 (second highest priority after session termination)
+    if intent_type == 'transcription_failed' and session_doc:
+        # User's transcription failed, return previous assistant message with transcription error prefix
+        try:
+            client_transcription = _connect_mongo()
+            chats_db = client_transcription['chats']
+            user_coll = chats_db[user_id]
+            
+            # Get the last assistant message from the session
+            current_session = user_coll.find_one({'sessionId': session_id})
+            last_assistant_message = None
+            
+            if current_session and current_session.get('messages'):
+                # Find the most recent assistant message
+                messages = current_session.get('messages', [])
+                for msg in reversed(messages):  # Search from newest to oldest
+                    if msg.get('role') == 'assistant':
+                        # Extract text from content array
+                        content = msg.get('content', [])
+                        if content and isinstance(content, list) and len(content) > 0:
+                            text_content = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
+                            if text_content and not text_content.startswith('ERROR:') and not text_content.startswith('⚠️ **Transcription Failed**'):
+                                last_assistant_message = text_content
+                                break
+            
+            # Prepare the transcription failed message
+            if last_assistant_message:
+                transcription_failed_message = (
+                    "⚠️ **Transcription Failed**\n\n"
+                    "I'm sorry, but I couldn't understand your voice message clearly. Here's my previous response:\n\n"
+                    f"{last_assistant_message}\n\n"
+                    "Please try typing your message or speaking more clearly if you'd like to continue."
+                )
+            else:
+                # No previous message found, provide a generic transcription error message
+                transcription_failed_message = (
+                    "⚠️ **Transcription Failed**\n\n"
+                    "I'm sorry, but I couldn't understand your voice message clearly. "
+                    "Please try typing your message or speaking more clearly. "
+                    "How can I assist you with your government service needs?"
+                )
+            
+            # Also append this message to session history
+            try:
+                new_msg = {
+                    'role': 'assistant',
+                    'content': [{'text': transcription_failed_message}],
+                    'timestamp': created_at_iso
+                }
+                user_coll.update_one({'sessionId': session_id}, {'$push': {'messages': new_msg}})
+            except Exception:
+                # Non-fatal; if this fails we'll still return the message
+                if _should_log():
+                    logger.exception('Failed to append transcription failure message to session')
+            
+            if _should_log():
+                logger.info('Handled transcription failure for session: %s, found previous message: %s', 
+                            session_id, bool(last_assistant_message))
+            
+            # Return the transcription failed message
+            resp_body = {
+                'status': {'statusCode': 200, 'message': 'Success'},
+                'data': {
+                    'messageId': message_id,
+                    'message': transcription_failed_message,
+                    'createdAt': created_at_z,
+                    'sessionId': session_id,
+                    'attachment': attachments,
+                    'intent_type': 'transcription_failed'
+                }
+            }
+            
+            client_transcription.close()
+            return _cors_response(200, resp_body)
+            
+        except Exception as e:
+            if _should_log():
+                logger.error('Failed to handle transcription failure: %s', str(e))
+            # If transcription failure handling fails, provide a basic error message
+            basic_transcription_error = (
+                "⚠️ **Transcription Failed**\n\n"
+                "I'm sorry, but I couldn't understand your voice message clearly. "
+                "Please try typing your message or speaking more clearly. "
+                "How can I assist you with your government service needs?"
+            )
+            
+            resp_body = {
+                'status': {'statusCode': 200, 'message': 'Success'},
+                'data': {
+                    'messageId': message_id,
+                    'message': basic_transcription_error,
+                    'createdAt': created_at_z,
+                    'sessionId': session_id,
+                    'attachment': attachments,
+                    'intent_type': 'transcription_failed_fallback'
+                }
+            }
+            return _cors_response(200, resp_body)
     
     # Check for session timeout choice response
     timeout_awaiting_choice = session_doc and session_doc.get('context', {}).get('timeout_awaiting_choice')
