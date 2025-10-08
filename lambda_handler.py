@@ -733,25 +733,87 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
     return "Service data verified. @TODO: implement next workflow steps."
 
 def _detect_service_intent(message_lower: str):
-    """Detect high-level service intents from a free-form user message.
+    """Detect high-level service intents from a free-form user message using Bedrock AI.
 
     Returns one of: 'renew_license', 'pay_tnb_bill' or None.
-    Detection is conservative: requires presence of key verbs + domain terms.
+    Uses AI to intelligently detect user intent even with varied phrasing.
     """
     if not message_lower:
         return None
 
-    # Driving license renewal
-    if any(k in message_lower for k in ['renew', 'renewal', 'renewing']) and \
-       any(k in message_lower for k in ['license', 'driving license', 'lesen', 'driver license', 'license']):
-        return 'renew_license'
+    # Keep original message for better context (don't just use lowercased version)
+    original_message = message_lower
 
-    # TNB bill payment (Tenaga Nasional Berhad - Malaysia electric utility)
-    if any(k in message_lower for k in ['pay', 'payment', 'bayar']) and \
-       any(k in message_lower for k in ['tnb', 'electric', 'electricity', 'bill', 'bil elektrik']):
-        return 'pay_tnb_bill'
+    try:
+        # Create a focused prompt for service intent detection
+        intent_prompt = (
+            "SYSTEM: You are a service intent classifier for MyGovHub, a Malaysian government services portal. "
+            "Analyze the user's message and determine if they want one of these specific services:\n\n"
+            "AVAILABLE SERVICES:\n"
+            "1. LICENSE_RENEWAL: User wants to renew their driving license\n"
+            "   - Keywords: renew license, driving license renewal, lesen memandu, license extension, update license\n"
+            "   - Variations: extend my license, my license expires, need to renew driving permit\n\n"
+            "2. TNB_BILL_PAYMENT: User wants to pay TNB (electricity) bills\n"
+            "   - Keywords: pay TNB bill, electricity bill, TNB payment, bil elektrik\n"
+            "   - Variations: pay my electric bill, TNB account payment, utility bill payment\n\n"
+            "3. NONE: Message does not clearly indicate either service above\n"
+            "   - General inquiries, greetings, unclear requests, other services\n\n"
+            "IMPORTANT RULES:\n"
+            "- Only return one of these exact labels: LICENSE_RENEWAL, TNB_BILL_PAYMENT, or NONE\n"
+            "- Be conservative - if unsure between two services, return NONE\n"
+            "- Consider context clues and natural language variations\n"
+            "- Handle both English and Bahasa Malaysia phrases\n"
+            "- Do not return anything else - just the label\n\n"
+            "EXAMPLES:\n"
+            "- 'I need to renew my driving license' → LICENSE_RENEWAL\n"
+            "- 'My license is expiring soon' → LICENSE_RENEWAL\n"
+            "- 'Pay my TNB bill' → TNB_BILL_PAYMENT\n"
+            "- 'Electricity bill payment' → TNB_BILL_PAYMENT\n"
+            "- 'Hello, I need help' → NONE\n"
+            "- 'What services do you offer?' → NONE\n\n"
+            f"User message: \"{original_message}\"\n\n"
+            "Classification:"
+        )
 
-    return None
+        # Call Bedrock with a lower temperature for more consistent classification
+        ai_response = run_agent(
+            prompt=intent_prompt,
+            max_tokens=50,
+            temperature=0.1,  # Low temperature for consistent classification
+            top_p=0.8
+        ).strip().upper()
+
+        if _should_log():
+            logger.info('Service intent detection - Input: "%s", AI Response: "%s"', original_message, ai_response)
+
+        # Map AI response to internal intent names
+        if 'LICENSE_RENEWAL' in ai_response:
+            return 'renew_license'
+        elif 'TNB_BILL_PAYMENT' in ai_response:
+            return 'pay_tnb_bill'
+        elif 'NONE' in ai_response:
+            return None
+        else:
+            # Fallback: AI returned unexpected response, log and return None
+            if _should_log():
+                logger.warning('Unexpected AI response for service intent detection: "%s"', ai_response)
+            return None
+
+    except Exception as e:
+        # Fallback to simple keyword matching if Bedrock fails
+        if _should_log():
+            logger.error('Service intent detection with Bedrock failed, falling back to keywords: %s', str(e))
+        
+        # Original keyword-based logic as fallback
+        if any(k in message_lower for k in ['renew', 'renewal', 'renewing']) and \
+           any(k in message_lower for k in ['license', 'driving license', 'lesen', 'driver license']):
+            return 'renew_license'
+
+        if any(k in message_lower for k in ['pay', 'payment', 'bayar']) and \
+           any(k in message_lower for k in ['tnb', 'electric', 'electricity', 'bill', 'bil elektrik']):
+            return 'pay_tnb_bill'
+
+        return None
 
 def _connect_mongo():
     """Create a MongoDB client using ATLAS_URI from env.
