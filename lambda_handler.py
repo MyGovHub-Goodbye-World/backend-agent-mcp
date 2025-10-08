@@ -181,18 +181,27 @@ def _log_request(event, body_obj=None):
         logger.exception('Failed to log request')
 
 
-def _service_requirements_met(service_name: str, session_doc: dict) -> bool:
+def _service_requirements_met(service_name: str, session_doc: dict, ekyc_data: dict = None) -> bool:
     """Check if required verified fields exist for a given service.
 
     renew_license requires: a verified document containing full_name AND userId (IC number).
-    pay_tnb_bill requires: a verified document containing account_number AND invoice_number.
+    pay_tnb_bill requires: either eKYC tnb_account_no OR a verified document containing account_number AND invoice_number.
     Returns True when requirements satisfied, False otherwise.
     """
     if not service_name or not session_doc:
         return False
     ctx = (session_doc.get('context') or {})
 
-    # Must have at least one document_* entry in context overall
+    # Special handling for pay_tnb_bill with eKYC
+    if service_name == 'pay_tnb_bill' and ekyc_data:
+        # Check if eKYC has TNB account numbers
+        tnb_accounts = ekyc_data.get('tnb_account_no') or []
+        if isinstance(tnb_accounts, list) and tnb_accounts:
+            # eKYC has TNB accounts - service requirements are met
+            return True
+        # If no eKYC TNB accounts, fall through to document verification check
+
+    # Must have at least one document_* entry in context overall (for non-eKYC path)
     document_keys = [k for k in ctx.keys() if k.startswith('document_')]
     if not document_keys:
         return False
@@ -535,15 +544,23 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
             logger.error("Bill verification complete, but database name not configured. Please set ATLAS_DB_NAME environment variable.")
             return "Bill details verified, but I couldn't retrieve your bill records right now. Please try again shortly or provide more details."
         
-        # Get account number from verified document
+        # Get account number - first check for eKYC selected account, then fall back to document
         account_number = None
         if session_doc and session_doc.get('context'):
-            for key, doc_data in session_doc['context'].items():
-                if key.startswith('document_') and doc_data.get('isVerified') == 'verified':
-                    extracted_data = doc_data.get('extractedData', {})
-                    account_number = extracted_data.get('account_number')
-                    if account_number:
-                        break
+            # Priority 1: Check for user-selected eKYC account
+            account_number = session_doc['context'].get('selected_tnb_account')
+            if _should_log():
+                logger.info('TNB service message builder - session context: %s, selected_account: %s', 
+                          session_doc.get('context', {}), account_number)
+            
+            # Priority 2: Fall back to verified document
+            if not account_number:
+                for key, doc_data in session_doc['context'].items():
+                    if key.startswith('document_') and doc_data.get('isVerified') == 'verified':
+                        extracted_data = doc_data.get('extractedData', {})
+                        account_number = extracted_data.get('account_number')
+                        if account_number:
+                            break
         
         if not account_number:
             return "I couldn't find a verified account number. Please upload your TNB bill document first."
@@ -1625,6 +1642,10 @@ def lambda_handler(event, context):
     session_id = body.get('sessionId')
     ekyc = body.get('ekyc') or {}
     attachments = body.get('attachment', [])
+    
+    # Debug logging for eKYC
+    if _should_log():
+        logger.info('Request eKYC data: %s', ekyc)
 
     # Allow empty message if there are attachments (document upload scenario)
     if not user_id or session_id is None:
@@ -2146,6 +2167,114 @@ def lambda_handler(event, context):
                 
         return False
 
+    def _detect_account_selection(msg: str, available_accounts: list) -> str:
+        """
+        Detect user's TNB account selection from numbered options or direct account numbers.
+        Uses Bedrock AI to understand natural language selections.
+        
+        Args:
+            msg: User's message
+            available_accounts: List of available TNB account numbers
+            
+        Returns:
+            str: Selected account number, or empty string if no clear selection detected
+        """
+        if not msg or not isinstance(available_accounts, list) or not available_accounts:
+            return ""
+            
+        msg_clean = msg.strip()
+        
+        # First try simple pattern matching for numbers or direct account numbers
+        try:
+            # Check if message is just a number (1, 2, 3, etc.)
+            if msg_clean.isdigit():
+                choice_num = int(msg_clean)
+                if 1 <= choice_num <= len(available_accounts):
+                    selected_account = available_accounts[choice_num - 1]
+                    if _should_log():
+                        logger.info('Account selection by number: "%s" -> choice %d -> account %s', 
+                                  msg_clean, choice_num, selected_account)
+                    return selected_account
+            
+            # Check if message contains a direct account number
+            for account in available_accounts:
+                if account in msg_clean:
+                    if _should_log():
+                        logger.info('Account selection by direct match: "%s" -> account %s', msg_clean, account)
+                    return account
+                    
+        except Exception as e:
+            if _should_log():
+                logger.error('Pattern matching for account selection failed: %s', str(e))
+        
+        # Use AI for more complex selections
+        try:
+            # Create numbered list for AI context
+            account_list = ""
+            for i, account in enumerate(available_accounts, 1):
+                account_list += f"{i}. {account}\n"
+            
+            account_prompt = (
+                "SYSTEM: You are analyzing user messages to detect TNB account selection. "
+                "The user was shown a numbered list of TNB accounts and asked to select one.\n\n"
+                "Available TNB accounts:\n"
+                f"{account_list}\n"
+                "DETECTION RULES:\n"
+                "- User can select by number (e.g., '1', '2', 'option 1', 'choose 2')\n"
+                "- User can select by account number (e.g., '200123456789', 'account 200123456789')\n"
+                "- User can use natural language (e.g., 'first one', 'second account', 'the top one')\n"
+                "- Be flexible with language variations and typos\n"
+                "- Handle both English and Malay responses\n\n"
+                "RESPONSE FORMAT:\n"
+                "- If you can clearly identify an account selection, return ONLY the account number\n"
+                "- If the message is unclear or doesn't indicate a selection, return 'UNCLEAR'\n"
+                "- Do not return anything else - just the account number or 'UNCLEAR'\n\n"
+                "EXAMPLES:\n"
+                "- '1' → (first account number)\n"
+                "- 'option 2' → (second account number)\n"
+                "- 'first one' → (first account number)\n"
+                "- 'choose 200123456789' → 200123456789\n"
+                "- 'the second account' → (second account number)\n"
+                "- 'pilih 1' → (first account number)\n"
+                "- 'what is billing?' → UNCLEAR\n"
+                "- 'not sure' → UNCLEAR\n\n"
+                f"User message: \"{msg_clean}\"\n\n"
+                "Selected account:"
+            )
+
+            # Call Bedrock with low temperature for consistent parsing
+            ai_response = run_agent(
+                prompt=account_prompt,
+                max_tokens=50,
+                temperature=0.1,  # Very low temperature for consistent parsing
+                top_p=0.7
+            ).strip()
+
+            if _should_log():
+                logger.info('Account selection AI - Input: "%s", AI Response: "%s"', msg_clean, ai_response)
+
+            # Check if AI returned a valid account number
+            if ai_response and ai_response != 'UNCLEAR':
+                # Verify the AI response is one of our available accounts
+                for account in available_accounts:
+                    if account == ai_response or account in ai_response:
+                        if _should_log():
+                            logger.info('AI detected account selection: "%s" -> account %s', msg_clean, account)
+                        return account
+                        
+                # If AI returned something but it's not a valid account, log warning
+                if _should_log():
+                    logger.warning('AI returned invalid account selection: "%s" not in available accounts', ai_response)
+
+        except Exception as e:
+            if _should_log():
+                logger.error('Account selection detection with Bedrock failed: %s', str(e))
+        
+        # No clear selection detected
+        if _should_log():
+            logger.info('No clear account selection detected in message: "%s"', msg_clean)
+        return ""
+
     def _is_document_rejection(msg: str) -> bool:
         # Accept document-specific rejection responses - includes accuracy/correctness terms
         rejection_tokens = {
@@ -2230,6 +2359,7 @@ def lambda_handler(event, context):
         termination_tokens = {
             'exit', 'quit', 'end', 'stop', 'cancel', 'bye', 'goodbye', 'close',
             'terminate', 'finish', 'done', 'logout', 'log out', 'sign out', 'reset',
+            'restart', 'finish', 'complete',
             'keluar', 'berhenti', 'tamat', 'selesai', 'tutup', 'habis', 'ulang'
         }
         cleaned = msg.strip().lower()
@@ -3080,7 +3210,80 @@ def lambda_handler(event, context):
                 # Set intent to ask for valid numeric input
                 intent_type = 'invalid_duration_format'
 
-    # Check for TNB bill payment confirmations (when service is active and user says yes)
+    # Check for TNB account selection (when service is active and eKYC accounts are available)
+    elif active_service == 'pay_tnb_bill' and not unverified_doc_key and ekyc:
+        # Get eKYC accounts from current request
+        tnb_accounts = ekyc.get('tnb_account_no', [])
+        
+        if isinstance(tnb_accounts, list) and tnb_accounts:
+            # Check if user is selecting an account
+            selected_account = _detect_account_selection(message, tnb_accounts)
+            if selected_account:
+                # User selected an account - store ONLY the selected account number
+                try:
+                    client_account = _connect_mongo()
+                    chats_db = client_account['chats']
+                    user_coll = chats_db[user_id]
+                    session_to_update = new_session_generated if new_session_generated else session_id
+                    
+                    # Store only the selected account number (not full eKYC data)
+                    update_result = user_coll.update_one(
+                        {'sessionId': session_to_update}, 
+                        {'$set': {
+                            'context.selected_tnb_account': selected_account,
+                            f'context.{active_service}_workflow_state': 'account_selected'
+                        }}
+                    )
+                    
+                    if _should_log():
+                        logger.info('Account selection storage: sessionId=%s, account=%s, matched=%d, modified=%d', 
+                                  session_to_update, selected_account, update_result.matched_count, update_result.modified_count)
+                    
+                    # Refresh session document with updated context
+                    try:
+                        updated_session = user_coll.find_one({'sessionId': session_to_update})
+                        if updated_session:
+                            session_doc = updated_session
+                            if _should_log():
+                                logger.info('Session document refreshed after account selection')
+                    except Exception as refresh_error:
+                        if _should_log():
+                            logger.error('Failed to refresh session document: %s', str(refresh_error))
+                    
+                    client_account.close()
+                    if _should_log():
+                        logger.info('User selected TNB account: %s', selected_account)
+                    
+                    # Set intent to proceed with selected account
+                    intent_type = 'tnb_account_selected'
+                except Exception as e:
+                    if _should_log():
+                        logger.error('Failed to store selected TNB account: %s', str(e))
+        
+        # If no account selection detected, check for other TNB bill payment confirmations
+        if not intent_type and _is_affirmative(message_lower):
+            # Check current workflow state
+            current_workflow_state = None
+            try:
+                client_check_state = _connect_mongo()
+                chats_db = client_check_state['chats']
+                user_coll = chats_db[user_id]
+                session_current = new_session_generated if new_session_generated else session_id
+                current_session = user_coll.find_one({'sessionId': session_current})
+                if current_session and current_session.get('context'):
+                    current_workflow_state = current_session['context'].get(f'{active_service}_workflow_state')
+                client_check_state.close()
+            except Exception:
+                pass
+            
+            if current_workflow_state == 'tnb_bills_shown':
+                # User confirmed TNB bill payment, update state
+                _update_service_workflow_state('tnb_bills_confirmed')
+                intent_type = f'{active_service}_payment_confirmed'
+                if _should_log():
+                    logger.info('User confirmed TNB bill payment, updated workflow state')
+
+    # Check for TNB bill payment confirmations (LEGACY - for non-eKYC flow)
     elif active_service == 'pay_tnb_bill' and _is_affirmative(message_lower) and not unverified_doc_key:
         # Check current workflow state
         current_workflow_state = None
@@ -3183,7 +3386,7 @@ def lambda_handler(event, context):
 
     service_ready = False
     if active_service:
-        service_ready = _service_requirements_met(active_service, session_doc)
+        service_ready = _service_requirements_met(active_service, session_doc, ekyc)
         if _should_log():
             try:
                 logger.info('Service readiness check: service=%s ready=%s intent_type=%s', active_service, service_ready, intent_type)
@@ -3409,15 +3612,47 @@ def lambda_handler(event, context):
                     "If you already uploaded a document earlier and it's verified, just reply YES to proceed with renewal steps."
                 )
             elif intent_type == 'pay_tnb_bill':
-                # TNB bill payment intent - use existing prompt logic
-                prompt = (
-                    "SYSTEM: Respond ONLY with the following user guidance (no extra sentences).\n\n"
-                    "USER-FACING MESSAGE:\n"
-                    "I can help you pay your TNB electricity bill! ⚡\n\n"
-                    "To process your bill payment, I need to verify your account details and bill information. Please upload:\n\n"
-                    "📸 TNB Bill Document: Take a photo of your TNB bill (the upper portion showing your account number and amount due)\n\n"
-                    "Please ensure the photo is clear and all important details are visible. I'll extract the account information to help you with the payment process."
-                )
+                # TNB bill payment intent - check for eKYC accounts first
+                tnb_accounts = ekyc.get('tnb_account_no', []) if ekyc else []
+                
+                if _should_log():
+                    logger.info('TNB bill payment - eKYC data: %s, TNB accounts: %s', bool(ekyc), tnb_accounts)
+                
+                if isinstance(tnb_accounts, list) and tnb_accounts:
+                    # eKYC has TNB accounts - offer account selection
+                    if _should_log():
+                        logger.info('Found %d eKYC TNB accounts, showing selection prompt', len(tnb_accounts))
+                    
+                    account_list = ""
+                    for i, account in enumerate(tnb_accounts, 1):
+                        account_list += f"{i}. **{account}**\n"
+                    
+                    # Return direct message instead of using AI prompt to ensure correct response
+                    response_text = (
+                        "I can help you pay your TNB electricity bill! ⚡\n\n"
+                        "I found the following TNB accounts linked to your profile:\n\n"
+                        f"{account_list}\n"
+                        "Please select which account you'd like to pay bills for by replying with:\n"
+                        "• The **number** (e.g., \"1\" or \"2\")\n"
+                        "• The **account number** directly\n\n"
+                        "Which TNB account would you like to pay bills for?"
+                    )
+                    # Skip AI model call for this direct message
+                    model_error = None
+                else:
+                    # No eKYC accounts - use document upload prompt directly
+                    if _should_log():
+                        logger.info('No eKYC TNB accounts found, using document upload prompt')
+                    
+                    # Return direct message instead of using AI prompt to ensure correct response
+                    response_text = (
+                        "I can help you pay your TNB electricity bill! ⚡\n\n"
+                        "To process your bill payment, I need to verify your account details and bill information. Please upload:\n\n"
+                        "📸 TNB Bill Document: Take a photo of your TNB bill (the upper portion showing your account number and amount due)\n\n"
+                        "Please ensure the photo is clear and all important details are visible. I'll extract the account information to help you with the payment process."
+                    )
+                    # Skip AI model call for this direct message
+                    model_error = None
             elif session_id == '(new-session)':
                 # For first-time connection without service intent, request a welcome message
                 prompt = (
