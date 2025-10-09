@@ -1066,20 +1066,23 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
 def _detect_service_intent(message_lower: str):
     """Detect high-level service intents from a free-form user message using Bedrock AI.
 
-    Returns one of: 'renew_license', 'pay_tnb_bill' or None.
-    Uses AI to intelligently detect user intent even with varied phrasing.
+    Returns tuple: (intent, corrected_message) where:
+    - intent: one of 'renew_license', 'pay_tnb_bill' or None
+    - corrected_message: spelling-corrected version of the message or None if no corrections
+    Uses AI to intelligently detect user intent even with varied phrasing and spelling corrections.
     """
     if not message_lower:
-        return None
+        return None, None
 
     # Keep original message for better context (don't just use lowercased version)
     original_message = message_lower
 
     try:
-        # Create a focused prompt for service intent detection
+        # Create a focused prompt for service intent detection with spelling correction
         intent_prompt = (
             "SYSTEM: You are a service intent classifier for MyGovHub, a Malaysian government services portal. "
-            "Analyze the user's message and determine if they want one of these specific services:\n\n"
+            "Analyze the user's message and determine if they want one of these specific services. "
+            "Also provide a spelling-corrected version if there are typos.\n\n"
             "AVAILABLE SERVICES:\n"
             "1. LICENSE_RENEWAL: User wants to renew their driving license\n"
             "   - Keywords: renew license, driving license renewal, lesen memandu, license extension, update license\n"
@@ -1089,46 +1092,61 @@ def _detect_service_intent(message_lower: str):
             "   - Variations: pay my electric bill, TNB account payment, utility bill payment\n\n"
             "3. NONE: Message does not clearly indicate either service above\n"
             "   - General inquiries, greetings, unclear requests, other services\n\n"
+            "RESPONSE FORMAT:\n"
+            "Return your response in this exact format:\n"
+            "INTENT: [LICENSE_RENEWAL|TNB_BILL_PAYMENT|NONE]\n"
+            "CORRECTED: [corrected message if there are spelling errors, or NONE if no corrections needed]\n\n"
             "IMPORTANT RULES:\n"
-            "- Only return one of these exact labels: LICENSE_RENEWAL, TNB_BILL_PAYMENT, or NONE\n"
+            "- Only return one of these exact labels for INTENT: LICENSE_RENEWAL, TNB_BILL_PAYMENT, or NONE\n"
+            "- For CORRECTED: provide the corrected message only if there are clear spelling errors, otherwise return NONE\n"
             "- Be conservative - if unsure between two services, return NONE\n"
             "- Consider context clues and natural language variations\n"
             "- Handle both English and Bahasa Malaysia phrases\n"
-            "- Do not return anything else - just the label\n\n"
+            "- Minor typos should be corrected, but don't change the meaning or structure\n\n"
             "EXAMPLES:\n"
-            "- 'I need to renew my driving license' → LICENSE_RENEWAL\n"
-            "- 'My license is expiring soon' → LICENSE_RENEWAL\n"
-            "- 'Pay my TNB bill' → TNB_BILL_PAYMENT\n"
-            "- 'Electricity bill payment' → TNB_BILL_PAYMENT\n"
-            "- 'Hello, I need help' → NONE\n"
-            "- 'What services do you offer?' → NONE\n\n"
+            "- 'I need to renew my driving license' → INTENT: LICENSE_RENEWAL\nCORRECTED: NONE\n"
+            "- 'renw my licens pls' → INTENT: LICENSE_RENEWAL\nCORRECTED: renew my license please\n"
+            "- 'Pay my TNB bil' → INTENT: TNB_BILL_PAYMENT\nCORRECTED: Pay my TNB bill\n"
+            "- 'Hello, I need help' → INTENT: NONE\nCORRECTED: NONE\n\n"
             f"User message: \"{original_message}\"\n\n"
-            "Classification:"
+            "Response:"
         )
 
         # Call Bedrock with a lower temperature for more consistent classification
         ai_response = run_agent(
             prompt=intent_prompt,
-            max_tokens=50,
+            max_tokens=100,
             temperature=0.1,  # Low temperature for consistent classification
             top_p=0.8
-        ).strip().upper()
+        ).strip()
 
         if _should_log():
             logger.info('Service intent detection - Input: "%s", AI Response: "%s"', original_message, ai_response)
 
-        # Map AI response to internal intent names
-        if 'LICENSE_RENEWAL' in ai_response:
-            return 'renew_license'
-        elif 'TNB_BILL_PAYMENT' in ai_response:
-            return 'pay_tnb_bill'
-        elif 'NONE' in ai_response:
-            return None
-        else:
-            # Fallback: AI returned unexpected response, log and return None
-            if _should_log():
-                logger.warning('Unexpected AI response for service intent detection: "%s"', ai_response)
-            return None
+        # Parse the AI response
+        intent = None
+        corrected_message = None
+        
+        lines = ai_response.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('INTENT:'):
+                intent_part = line.replace('INTENT:', '').strip().upper()
+                if 'LICENSE_RENEWAL' in intent_part:
+                    intent = 'renew_license'
+                elif 'TNB_BILL_PAYMENT' in intent_part:
+                    intent = 'pay_tnb_bill'
+                elif 'NONE' in intent_part:
+                    intent = None
+            elif line.startswith('CORRECTED:'):
+                corrected_part = line.replace('CORRECTED:', '').strip()
+                if corrected_part.upper() != 'NONE':
+                    corrected_message = corrected_part
+
+        if _should_log():
+            logger.info('Parsed intent: %s, corrected_message: %s', intent, corrected_message)
+
+        return intent, corrected_message
 
     except Exception as e:
         # Fallback to simple keyword matching if Bedrock fails
@@ -1138,13 +1156,13 @@ def _detect_service_intent(message_lower: str):
         # Original keyword-based logic as fallback
         if any(k in message_lower for k in ['renew', 'renewal', 'renewing']) and \
            any(k in message_lower for k in ['license', 'driving license', 'lesen', 'driver license']):
-            return 'renew_license'
+            return 'renew_license', None
 
         if any(k in message_lower for k in ['pay', 'payment', 'bayar']) and \
            any(k in message_lower for k in ['tnb', 'electric', 'electricity', 'bill', 'bil elektrik']):
-            return 'pay_tnb_bill'
+            return 'pay_tnb_bill', None
 
-        return None
+        return None, None
 
 def _connect_mongo():
     """Create a MongoDB client using ATLAS_URI from env.
@@ -3479,7 +3497,17 @@ def lambda_handler(event, context):
     AVAILABLE_SERVICE_INTENTS = ['renew_license', 'pay_tnb_bill']
 
     if not intent_type and attachments == []:  # pure text request
-        service_intent = _detect_service_intent(message_lower)
+        service_intent, corrected_message = _detect_service_intent(message_lower)
+        
+        # Log spelling corrections if any were made
+        if corrected_message and _should_log():
+            logger.info('Spelling correction detected - Original: "%s", Corrected: "%s"', message_lower, corrected_message)
+        
+        # Use corrected message for further processing if available
+        if corrected_message:
+            message = corrected_message
+            message_lower = corrected_message.lower()
+        
         # Only set intent_type for NEW service requests, not when service is already active
         if service_intent == 'renew_license' and not active_service:
             intent_type = 'renew_license'
