@@ -3812,7 +3812,9 @@ def lambda_handler(event, context):
                         "Please select which account you'd like to pay bills for by replying with:\n"
                         "• The **number** (e.g., \"1\" or \"2\")\n"
                         "• The **account number** directly\n\n"
-                        "Which TNB account would you like to pay bills for?"
+                        "Which TNB account would you like to pay bills for?\n\n"
+                        "OR\n\n"
+                        "You could just snap the photo of your bill if you'd like to pay for a different account! 📸"
                     )
                     # Skip AI model call for this direct message
                     model_error = None
