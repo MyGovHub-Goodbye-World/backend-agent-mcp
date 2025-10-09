@@ -2798,8 +2798,22 @@ def lambda_handler(event, context):
             if _should_log():
                 logger.error('Failed to update workflow state: %s', str(e))
     
-    # Check for session termination request (highest priority - checked before all other logic)
-    if _is_session_termination_request(message) and not attachments:
+    # Determine active service early to check payment processing state
+    active_service = None
+    if session_doc:
+        active_service = session_doc.get('service') or None
+    
+    # Check for payment processing state first (higher priority than session termination)
+    if active_service and session_doc and not intent_type:
+        current_workflow_state = session_doc.get('context', {}).get(f'{active_service}_workflow_state')
+        if current_workflow_state == 'payment_processing':
+            # User is in payment processing state - check payment status instead of terminating
+            intent_type = 'check_payment_status'
+            if _should_log():
+                logger.info('User in payment_processing state, checking payment status instead of terminating')
+    
+    # Check for session termination request (only if not in payment processing)
+    if not intent_type and _is_session_termination_request(message) and not attachments:
         # User wants to end the session completely
         try:
             client_terminate = _connect_mongo()
@@ -3464,9 +3478,6 @@ def lambda_handler(event, context):
     service_intent = None
     AVAILABLE_SERVICE_INTENTS = ['renew_license', 'pay_tnb_bill']
 
-    # Determine active service (persisted) irrespective of current message intent
-    active_service = None
-
     if not intent_type and attachments == []:  # pure text request
         service_intent = _detect_service_intent(message_lower)
         # Only set intent_type for NEW service requests, not when service is already active
@@ -3499,6 +3510,9 @@ def lambda_handler(event, context):
             coll_refetch = db_refetch[user_id]
             session_current_id = new_session_generated if new_session_generated else session_id
             session_doc = coll_refetch.find_one({'sessionId': session_current_id}) or session_doc
+            # Update active_service from refreshed session_doc
+            if session_doc:
+                active_service = session_doc.get('service') or None
         except Exception:
             pass
         finally:
@@ -3506,9 +3520,6 @@ def lambda_handler(event, context):
                 client_refetch.close()
             except Exception:
                 pass
-
-    if session_doc:
-        active_service = session_doc.get('service') or None
 
     # Check for service-specific confirmations (when service is active and user says yes) - HIGHEST PRIORITY
     if active_service == 'renew_license' and _is_affirmative(message_lower) and not unverified_doc_key and not intent_type:
