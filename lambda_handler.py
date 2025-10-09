@@ -1577,6 +1577,35 @@ def _parse_document_corrections(message: str, current_data: dict) -> dict:
     return corrections
 
 
+def _classify_intent_with_bedrock(msg):
+    """
+    Use Bedrock to classify user intent as SERVICE_INTENT, INQUERY, or OTHER.
+    SERVICE_INTENT: User wants to perform a government service (renew license, pay bill, etc.)
+    INQUERY: User is asking a general government-related question (Q&A, info, FAQ)
+    OTHER: Not related to government services or Q&A
+    """
+    prompt = (
+        "SYSTEM: You are an intent classifier for a government services chatbot. "
+        "Classify the user's message as one of the following INTENT_LABELS (respond with ONLY the label):\n"
+        "- SERVICE_INTENT: User wants to perform a government service (e.g., renew license, pay bill, apply permit, check status, get documents)\n"
+        "- INQUERY: User is asking a general government-related question, FAQ, or informational query (not a direct service command)\n"
+        "- OTHER: Not related to government services or Q&A\n\n"
+        "User message: '" + msg.strip() + "'\n\n"
+        "INTENT_LABEL:"
+    )
+    try:
+        result = run_agent(prompt, max_tokens=10, temperature=0.1, top_p=0.7).strip().upper()
+        if 'SERVICE_INTENT' in result:
+            return 'service_intent'
+        elif 'INQUERY' in result:
+            return 'inquery'
+        else:
+            return 'other'
+    except Exception as e:
+        if _should_log():
+            logger.error('Bedrock intent classifier failed: %s', str(e))
+        return 'other'
+
 def lambda_handler(event, context):
     """Handle new request format and return MCP-style response.
 
@@ -1661,9 +1690,50 @@ def lambda_handler(event, context):
     created_at_iso = dt.isoformat()
     created_at_z = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
+    
+    # --- Detect general government Q&A (inquery intent) ---
+    def _classify_intent_with_bedrock(msg):
+        """
+        Use Bedrock to classify user intent as SERVICE_INTENT, INQUERY, or OTHER.
+        SERVICE_INTENT: User wants to perform a government service (renew license, pay bill, etc.)
+        INQUERY: User is asking a general government-related question (Q&A, info, FAQ)
+        OTHER: Not related to government services or Q&A
+        """
+        prompt = (
+            "SYSTEM: You are an intent classifier for a government services chatbot. "
+            "Classify the user's message as one of the following INTENT_LABELS (respond with ONLY the label):\n"
+            "- SERVICE_INTENT: User wants to perform a government service (e.g., renew license, pay bill, apply permit, check status, get documents)\n"
+            "- INQUERY: User is asking a general government-related question, FAQ, or informational query (not a direct service command)\n"
+            "- OTHER: Not related to government services or Q&A\n\n"
+            "User message: '" + msg.strip() + "'\n\n"
+            "INTENT_LABEL:"
+        )
+        try:
+            result = run_agent(prompt, max_tokens=10, temperature=0.1, top_p=0.7).strip().upper()
+            if 'SERVICE_INTENT' in result:
+                return 'service_intent'
+            elif 'INQUERY' in result:
+                return 'inquery'
+            else:
+                return 'other'
+        except Exception as e:
+            if _should_log():
+                logger.error('Bedrock intent classifier failed: %s', str(e))
+            return 'other'
+
     # If new session or continue session, create sessionId and initialize collection/document in MongoDB (required)
     new_session_generated = None
+
+    # Check for document attachments and process them
+    ocr_result = None
+    intent_type = None
+
     try:
+        # --- Use Bedrock-powered intent classifier ---
+        if not intent_type:
+            classified_intent = _classify_intent_with_bedrock(message)
+            if classified_intent == 'inquery':
+                intent_type = 'inquery'
         client = _connect_mongo()
     except RuntimeError as e:
         return _cors_response(500, {'error': str(e)})
@@ -1849,10 +1919,6 @@ def lambda_handler(event, context):
             client.close()
         except Exception:
             pass
-
-    # Check for document attachments and process them
-    ocr_result = None
-    intent_type = None
     
     # Check for transcription failure from Layer 1 using Bedrock AI
     if message and message.strip():
@@ -1899,21 +1965,21 @@ def lambda_handler(event, context):
             ).strip().upper()
 
             if _should_log():
-                logger.info('Transcription failure detection - Input: "%s", AI Response: "%s"', message.strip(), ai_response)
+                logger.info('Transcription malfunction detection - Input: "%s", AI Response: "%s"', message.strip(), ai_response)
 
             # Check AI response
             if 'TRANSCRIPTION_FAILED' in ai_response:
                 intent_type = 'transcription_failed'
                 if _should_log():
-                    logger.info('Detected transcription failure via Bedrock AI: "%s"', message.strip())
+                    logger.info('Detected transcription malfunction via Bedrock AI: "%s"', message.strip())
             elif 'NORMAL_MESSAGE' in ai_response:
                 # Not a transcription failure, continue with normal processing
                 if _should_log():
-                    logger.info('Message classified as normal (not transcription failure): "%s"', message.strip())
+                    logger.info('Message classified as normal (not transcription malfunction): "%s"', message.strip())
             else:
                 # Unexpected AI response, log and fallback to keyword detection
                 if _should_log():
-                    logger.warning('Unexpected AI response for transcription failure detection: "%s", falling back to keywords', ai_response)
+                    logger.warning('Unexpected AI response for transcription malfunction detection: "%s", falling back to keywords', ai_response)
                 
                 # Fallback to exact string matching for known failure messages
                 failure_messages = [
@@ -1928,18 +1994,18 @@ def lambda_handler(event, context):
                 if any(msg.lower() in message.strip().lower() for msg in failure_messages):
                     intent_type = 'transcription_failed'
                     if _should_log():
-                        logger.info('Detected transcription failure via fallback keywords: "%s"', message.strip())
+                        logger.info('Detected transcription malfunction via fallback keywords: "%s"', message.strip())
 
         except Exception as e:
             # Fallback to simple string matching if Bedrock fails
             if _should_log():
-                logger.error('Transcription failure detection with Bedrock failed, falling back to exact matching: %s', str(e))
+                logger.error('Transcription malfunction detection with Bedrock failed, falling back to exact matching: %s', str(e))
             
             # Original exact matching as ultimate fallback
             if message.strip() == 'Transcription failed.' or message.strip() == 'Transcription completed but text retrieval failed.':
                 intent_type = 'transcription_failed'
                 if _should_log():
-                    logger.info('Detected transcription failure via exact string matching: "%s"', message.strip())
+                    logger.info('Detected transcription malfunction via exact string matching: "%s"', message.strip())
     
     # Check document verification status and handle user responses
     verification_status = None
@@ -3937,11 +4003,11 @@ def lambda_handler(event, context):
                         # For ID card, prompt user to choose what service they need
                         response_text = (
                             "Thank you for verifying your ID card information! I can help you with various government services:\n\n"
-                            "🔄 **Renew driving license** - Type: \"renew license\" or \"license renewal\"\n"
-                            "💡 **Pay TNB electricity bill** - Type: \"pay TNB bill\" or \"TNB payment\"\n"
-                            "📄 **Apply for permits** - Type: \"apply permit\"\n"
-                            "📋 **Check application status** - Type: \"check status\"\n"
-                            "📁 **Access official documents** - Type: \"get documents\"\n\n"
+                            "🔄 Renew driving license\"\n"
+                            "💡 Pay TNB electricity bill\"\n"
+                            "📄 Apply for permits\"\n"
+                            "📋 Check application status\"\n"
+                            "📁 Access official documents\"\n"
                             "What would you like to do today?"
                         )
                         # Skip AI model call for this direct message
@@ -4113,6 +4179,45 @@ def lambda_handler(event, context):
                     "What would you like to do next?"
                 )
                 model_error = None  # No model error since we're bypassing the AI model
+            elif intent_type == 'inquery':
+                # --- INQUERY INTENT HANDLING ---
+                # Strictly answer only from provided URLs, fallback to online search with prefix
+                INQUERY_SOURCES = [
+                    "https://data.gov.my/",
+                    "https://jpj.my/malaysian_driving_license.htm",
+                    "https://www.jpj.my/misc/driving_license_classes.htm",
+                    "https://en.wikipedia.org/wiki/Driving_licence_in_Malaysia",
+                    "https://insights.mudah.my/7-types-of-driving-licences-in-malaysia-and-how-to-get-it/",
+                    "https://www.jpj.gov.my/en/faq-driving/",
+                    "https://www.malaysia.gov.my/portal/content/30348",
+                    "https://www.jpj.gov.my/hubungi-kami/",
+                    "https://metafin.com.my/blog/online-driving-license-renewal-in-5-minutes/",
+                    "https://www.jpj.gov.my/en/renewal-of-learners-license-ldl/",
+                    "https://www.pos.com.my/jpj",
+                    "https://www.malaysia.gov.my/portal/content/31198",
+                    "https://www.jpj.my/faqs/driving_license_faqs.htm",
+                    "https://www.carlist.my/news/how-to-renew-your-driving-license-online-with-myjpj-app-135915/135915/",
+                    "https://direct.generali.com.my/articles/how-to-renew-your-malaysian-driving-license-with-myjpj-app",
+                    "https://www.mytnb.com.my/faq",
+                    "https://www.mytnb.com.my/tariff/index.html?v=1.1.46",
+                    "https://www.tnb.com.my/faq/owner-tenant-issues/",
+                    "https://www.tnb.com.my/residential/payment-methods",
+                    "https://www.tnb.com.my/contact-us/customer-care",
+                    "https://www.mytnb.com.my/contact-us"
+                ]
+                # Build a SYSTEM prompt for the model to answer strictly from these sources
+                prompt = (
+                    "SYSTEM: You are a government services Q&A assistant. The user is asking a question about government services. "
+                    "You MUST answer strictly using information from the following sources ONLY (do not use any other source):\n"
+                    + "\n".join(INQUERY_SOURCES) +
+                    "\n\nIf you cannot find the answer in these sources, reply: 'Sorry, I could not find the answer in the official sources provided.' "
+                    "If you must use an online search, you MUST start your answer with: 'Based on the source of <link>, ...' and provide the link. "
+                    "If the question is not related to government services, politely decline to answer.\n\n"
+                    "User question: " + message + "\n"
+                )
+                # Do not save 'inquery' intent_type to MongoDB messages (handled below)
+                # Model will generate the answer
+                # (response_text will be set after model call below)
             elif intent_type == 'invalid_duration_format':
                 # User provided invalid duration format - use direct response
                 response_text = (
@@ -4133,22 +4238,14 @@ def lambda_handler(event, context):
                     service_intent = _detect_service_intent(message)
                     
                     if not service_intent:
-                        # No service detected - prompt user to select a service
+                        # No service detected - politely reject non-government questions
                         if _should_log():
-                            logger.info('No active service and no service intent detected, prompting for service selection')
-                        
+                            logger.info('No active service and no service intent detected, rejecting non-government question')
                         response_text = (
-                            "I'd be happy to help you! Please let me know what you'd like to do:\n\n"
-                            "🔄 **Renew driving license** - Type: \"renew license\" or \"license renewal\"\n"
-                            "💡 **Pay TNB electricity bill** - Type: \"pay TNB bill\" or \"TNB payment\"\n"
-                            "📄 **Apply for permits** - Type: \"apply permit\"\n"
-                            "📋 **Check application status** - Type: \"check status\"\n"
-                            "📁 **Access official documents** - Type: \"get documents\"\n\n"
-                            "You can also upload a document directly, and I'll automatically detect what service you need!\n\n"
-                            "What would you like to do today?"
+                            "Sorry, I can only answer questions related to Malaysian government services. "
+                            "Please ask about license renewal, bill payments, permits, application status, or other official topics."
                         )
                         model_error = None  # No model error since we're bypassing the AI model
-                        
                         # Skip the generic prompt building below
                         parts = None
                     else:
@@ -4256,72 +4353,72 @@ def lambda_handler(event, context):
                 logger.info('Using direct service response, skipping AI model call. Response length: %d chars', len(response_text or ''))
 
         # Persist the conversation: always push user message first, then assistant or error message
-        session_to_update = new_session_generated if new_session_generated else session_id
-        try:
-            client2 = _connect_mongo()
-            db2 = client2['chats']
-            coll2 = db2[user_id]
-
-            # push the user message (always)
-            user_msg_doc = {
-                'messageId': message_id,
-                'timestamp': user_timestamp_iso,
-                'role': 'user',
-                'content': [{'text': str(message)}]
-            }
-            
-            # Add attachment reference instead of full attachment with expiring URL
-            if attachments:
-                attachment = attachments[0]
-                sanitized_filename = attachment['name'].replace('.', '_')
-                user_msg_doc['attachment'] = {
-                    "reference": f'document_{sanitized_filename}',
-                    "type": attachment.get('type', 'unknown'),
-                    "name": attachment['name']
-                }
-                
-            if intent_type:
-                user_msg_doc['intent'] = intent_type
-                
-            coll2.update_one({'sessionId': session_to_update}, {'$push': {'messages': user_msg_doc}}, upsert=True)
-
-            # push the assistant message; if model failed, store an error message as assistant reply
-            assistant_message_id = str(uuid.uuid4())
-            
-            if response_text is not None:
-                assistant_msg_doc = {
-                    'messageId': assistant_message_id,
-                    'timestamp': created_at_iso,
-                    'role': 'assistant',
-                    'content': [{'text': str(response_text)}]
-                }
-            else:
-                assistant_msg_doc = {
-                    'messageId': assistant_message_id,
-                    'timestamp': created_at_iso,
-                    'role': 'assistant',
-                    'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}],
-                    'meta': {'modelError': model_error}
-                }
-
-            coll2.update_one({'sessionId': session_to_update}, {'$push': {'messages': assistant_msg_doc}}, upsert=True)
-        except Exception as e:
-            # If persisting conversation fails, return 500 to enforce durability and include traceback for debugging
-            tb = traceback.format_exc()
-            print('Failed to persist conversation:', str(e))
-            print(tb)
+        # For 'inquery' intent, do NOT save intent_type or messages to MongoDB
+        if intent_type == 'inquery':
+            # skip persistence for inquery
+            session_to_update = session_id  # ensure session_to_update is always set for response payload
+        else:
+            session_to_update = new_session_generated if new_session_generated else session_id
             try:
-                if 'client2' in locals() and client2:
-                    client2.close()
-            except Exception:
-                pass
-            return _cors_response(500, {'error': f'Failed to persist conversation: {str(e)}', 'trace': tb})
-        finally:
-            try:
-                if 'client2' in locals() and client2:
-                    client2.close()
-            except Exception:
-                pass
+                client2 = _connect_mongo()
+                db2 = client2['chats']
+                coll2 = db2[user_id]
+
+                # push the user message (always)
+                user_msg_doc = {
+                    'messageId': message_id,
+                    'timestamp': user_timestamp_iso,
+                    'role': 'user',
+                    'content': [{'text': str(message)}]
+                }
+                # Add attachment reference instead of full attachment with expiring URL
+                if attachments:
+                    attachment = attachments[0]
+                    sanitized_filename = attachment['name'].replace('.', '_')
+                    user_msg_doc['attachment'] = {
+                        "reference": f'document_{sanitized_filename}',
+                        "type": attachment.get('type', 'unknown'),
+                        "name": attachment['name']
+                    }
+                if intent_type:
+                    user_msg_doc['intent'] = intent_type
+                coll2.update_one({'sessionId': session_to_update}, {'$push': {'messages': user_msg_doc}}, upsert=True)
+
+                # push the assistant message; if model failed, store an error message as assistant reply
+                assistant_message_id = str(uuid.uuid4())
+                if response_text is not None:
+                    assistant_msg_doc = {
+                        'messageId': assistant_message_id,
+                        'timestamp': created_at_iso,
+                        'role': 'assistant',
+                        'content': [{'text': str(response_text)}]
+                    }
+                else:
+                    assistant_msg_doc = {
+                        'messageId': assistant_message_id,
+                        'timestamp': created_at_iso,
+                        'role': 'assistant',
+                        'content': [{'text': 'ERROR: assistant failed to respond. See modelError in response.'}],
+                        'meta': {'modelError': model_error}
+                    }
+                coll2.update_one({'sessionId': session_to_update}, {'$push': {'messages': assistant_msg_doc}}, upsert=True)
+            except Exception as e:
+                # If persisting conversation fails, return 500 to enforce durability and include traceback for debugging
+                tb = traceback.format_exc()
+                print('Failed to persist conversation:', str(e))
+                print(tb)
+                try:
+                    if 'client2' in locals() and client2:
+                        client2.close()
+                except Exception:
+                    pass
+                return _cors_response(500, {'error': f'Failed to persist conversation: {str(e)}', 'trace': tb})
+            finally:
+                try:
+                    if 'client2' in locals() and client2:
+                        client2.close()
+                except Exception:
+                    pass
 
         # Handle continue_services by creating new session
         continue_services_new_session = None
