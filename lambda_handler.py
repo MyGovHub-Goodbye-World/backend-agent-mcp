@@ -3777,17 +3777,38 @@ def lambda_handler(event, context):
                 logger.info('Generating prompt. Intent type: %s, Verification status: %s', intent_type or 'None', verification_status or 'None')
 
             if intent_type == 'renew_license':
-                # License renewal intent - use existing prompt logic
-                prompt = (
-                    "SYSTEM: Respond with ONLY the following guidance (no extra elaboration beyond minor natural phrasing allowed).\n\n"
-                    "USER-FACING MESSAGE:\n"
-                    "I can help you renew your driving license!\n\n"
-                    "To proceed with the renewal, I need to verify your identity and current license details. Please upload one of the following documents:\n\n"
-                    "📸 Option 1: Your current driving license (photo of the front side)\n"
-                    "📸 Option 2: Your IC (Identity Card) - front side\n\n"
-                    "Please take a clear photo and send it to me. I'll extract the necessary information to process your license renewal.\n"
-                    "If you already uploaded a document earlier and it's verified, just reply YES to proceed with renewal steps."
-                )
+                # Check for already verified license or idcard document
+                verified_license = None
+                if session_doc and session_doc.get('context'):
+                    for doc_key, doc_data in session_doc['context'].items():
+                        if doc_data.get('isVerified') == 'verified' and doc_data.get('categoryDetection'):
+                            cat = doc_data['categoryDetection'].get('detected_category', '').lower()
+                            if cat in ('license', 'license-front', 'license-back', 'idcard'):
+                                verified_license = doc_data
+                                break
+
+                if verified_license:
+                    # Already have a verified license/idcard, proceed with renewal steps
+                    if not active_service:
+                        active_service = 'renew_license'
+                    service_message = _build_service_next_step_message(active_service, user_id, session_id, session_doc)
+                    if service_message.startswith('SYSTEM:'):
+                        prompt = service_message
+                    else:
+                        response_text = service_message
+                        model_error = None
+                else:
+                    # No verified license/idcard, show upload prompt
+                    prompt = (
+                        "SYSTEM: Respond with ONLY the following guidance (no extra elaboration beyond minor natural phrasing allowed).\n\n"
+                        "USER-FACING MESSAGE:\n"
+                        "I can help you renew your driving license!\n\n"
+                        "To proceed with the renewal, I need to verify your identity and current license details. Please upload one of the following documents:\n\n"
+                        "📸 Option 1: Your current driving license (photo of the front side)\n"
+                        "📸 Option 2: Your IC (Identity Card) - front side\n\n"
+                        "Please take a clear photo and send it to me. I'll extract the necessary information to process your license renewal.\n"
+                        "If you already uploaded a document earlier and it's verified, just reply YES to proceed with renewal steps."
+                    )
             elif intent_type == 'pay_tnb_bill':
                 # TNB bill payment intent - check for eKYC accounts first
                 tnb_accounts = ekyc.get('tnb_account_no', []) if ekyc else []
