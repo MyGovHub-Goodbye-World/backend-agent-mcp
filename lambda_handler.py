@@ -1035,13 +1035,110 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
             except Exception:
                 return "Error retrieving payment details. Please try again."
         elif workflow_state == 'payment_completed':
-            # Payment already completed - show completion message
-            return (
-                f"**✅ TNB Payment Already Completed**\n\n"
-                f"Your TNB bill payment has already been processed and completed successfully.\n\n"
-                f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
-                f"MyGovHub Support Team"
-            )
+            # Check if payment has been completed and generate receipt
+            payment_status = _check_payment_status(session_id, user_id)
+            if payment_status and payment_status['status'] == 'paid':
+                # Payment confirmed! Generate receipt and show success message
+                try:
+                    client_success = _connect_mongo()
+                    chats_db = client_success['chats']
+                    user_coll = chats_db[user_id]
+                    
+                    metadata = payment_status.get('metadata', {})
+                    amount = payment_status.get('amount', 0)
+                    
+                    # Generate receipt for TNB bill payment
+                    receipt_url = None
+                    try:
+                        generate_receipt_api_url = os.getenv('GENERATE_RECEIPT_API_URL')
+                        if generate_receipt_api_url:
+                            # Get transaction data from MongoDB
+                            db_name = os.getenv('ATLAS_DB_NAME')
+                            if db_name:
+                                transactions_coll = client_success[db_name]['transactions']
+                                transaction = transactions_coll.find_one({
+                                    'userId': user_id,
+                                    'metadata.sessionId': session_id,
+                                    'status': 'paid'
+                                })
+                                
+                                if transaction:
+                                    # Get bill details from session context
+                                    current_session = user_coll.find_one({'sessionId': session_id})
+                                    bills_data = current_session.get('context', {}).get('database_bills', [])
+                                    
+                                    if bills_data:
+                                        # Use the first bill as the primary bill for receipt
+                                        primary_bill = bills_data[0]
+                                        
+                                        # Prepare receipt request payload in TNB format
+                                        receipt_payload = {
+                                            "bill": primary_bill.get('bill', {}),
+                                            "status": "paid",
+                                            "pembayaran": {
+                                                "jumlah": transaction.get('amount', amount),
+                                                "tarikh_bayar": datetime.now(timezone.utc).strftime('%d-%m-%Y'),
+                                                "kaedah": "Online",
+                                                "rujukan": str(transaction.get('_id', ''))
+                                            },
+                                            "phone_number": "+60123456789"  # Default phone number
+                                        }
+                                        
+                                        # Call receipt generation API
+                                        receipt_response = requests.post(
+                                            generate_receipt_api_url,
+                                            json=receipt_payload,
+                                            headers={'Content-Type': 'application/json'},
+                                            timeout=30
+                                        )
+                                        receipt_response.raise_for_status()
+                                        receipt_result = receipt_response.json()
+                                        
+                                        receipt_url = receipt_result.get('receipt_url')
+                                        if _should_log():
+                                            logger.info('TNB receipt generated successfully: %s', receipt_url)
+                    except Exception as receipt_e:
+                        if _should_log():
+                            logger.error('Failed to generate TNB receipt: %s', str(receipt_e))
+                        # Continue without receipt - don't fail the payment completion
+                    
+                    client_success.close()
+                    
+                    success_message = (
+                        f"**🎉 TNB Bill Payment Successful! 🎉**\n\n"
+                        f"**Transaction Completed:**\n"
+                        f"• Account No: {account_number}\n"
+                        f"• Amount Paid: RM {amount:.2f}\n\n"
+                        f"**Important:**\n"
+                        f"• Your TNB bill payment has been successfully processed\n"
+                        f"• You will receive a confirmation email shortly\n"
+                        f"• Please keep this transaction reference for your records\n"
+                    )
+                    
+                    # Add receipt URL if generated
+                    if receipt_url:
+                        success_message += f"• 📄 **Receipt:** [Download PDF]({receipt_url})\n"
+                    
+                    success_message += (
+                        f"\n\nThank you for using MyGovHub services! ⚡😊\n\n"
+                        f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
+                        f"MyGovHub Support Team"
+                    )
+                    
+                    return success_message
+                    
+                except Exception as e:
+                    if _should_log():
+                        logger.error('Failed to process TNB payment completion: %s', str(e))
+                    return "Payment completed but there was an error updating your records. Please contact support."
+            else:
+                # Payment already completed - show completion message
+                return (
+                    f"**✅ TNB Payment Already Completed**\n\n"
+                    f"Your TNB bill payment has already been processed and completed successfully.\n\n"
+                    f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
+                    f"MyGovHub Support Team"
+                )
         else:
             # First time or default - show bill info and ask for confirmation
             # Set workflow state to track that we've shown bills info
