@@ -544,11 +544,11 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                         f"Your license renewal payment of **RM {payment_payload['amount']:.2f}** is ready for processing.\n\n"
                         f"Please click the link below to complete your payment:\n\n"
                         f"🔗 **[Pay Now]({payment_result['url']})**\n\n"
-                        f"After completing the payment, send me any message and I'll check the status for you.\n\n"
                         f"**Payment Details:**\n"
                         f"• License: {payment_payload['metadata'].get('licenseNumber', 'N/A')}\n"
                         f"• Duration: {payment_payload['metadata'].get('renewalYears', 1)} year{'s' if payment_payload['metadata'].get('renewalYears', 1) > 1 else ''}\n"
-                        f"• Amount: RM {payment_payload['amount']:.2f}"
+                        f"• Amount: RM {payment_payload['amount']:.2f}\n\n"
+                        f"After completing the payment, send me any message and I'll check the status for you."
                     )
                     
                 except requests.RequestException as payment_e:
@@ -715,12 +715,12 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                         f"**Important:**\n"
                         f"• Your license has been successfully renewed\n"
                         f"• You will receive a confirmation email shortly\n"
-                        f"• Please keep this transaction reference for your records\n"
+                        f"• Please keep this transaction reference for your records\n\n"
                     )
                     
                     # Add receipt URL if generated
                     if receipt_url:
-                        success_message += f"• 📄 **Receipt:** [Download PDF]({receipt_url})\n"
+                        success_message += f"📄 **Receipt:** [Download PDF]({receipt_url})\n"
                     
                     success_message += "\n"
                     
@@ -750,7 +750,6 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     f"then send me another message to check the status again.\n\n"
                     f"If you've already paid and this message persists, please wait a few minutes for the payment to be confirmed."
                 )
-
         elif workflow_state == 'payment_completed':
             # Payment already completed - show completion message
             return (
@@ -1007,120 +1006,295 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
             )
         
         # Handle different workflow states
-        if workflow_state == 'tnb_bills_confirmed':
-            # User confirmed payment, now ask for payment confirmation
+        if workflow_state == 'bill_payment_confirmed':
+            # Process payment through Billplz API
             try:
-                client_payment_confirm = _connect_mongo()
-                chats_db = client_payment_confirm['chats']
+                client_payment = _connect_mongo()
+                chats_db = client_payment['chats']
                 user_coll = chats_db[user_id]
                 current_session = user_coll.find_one({'sessionId': session_id})
+
+                if not current_session:
+                    return "Error: Session not found. Please try again."
+
+                TNB_COLLECTION_ID = os.getenv('TNB_COLLECTION_ID')
+                TNB_API_KEY = os.getenv('TNB_API_KEY')
+                payment_api_url = os.getenv('PAYMENT_CREATE_BILL_API_URL')
                 
-                # Get stored payment details
-                total_amount = 0.0
-                bill_count = 0
-                if current_session and current_session.get('context'):
-                    total_amount = current_session['context'].get(f'{service_name}_total_amount', 0.0)
-                    bill_count = current_session['context'].get(f'{service_name}_bill_count', 0)
+                if not all([TNB_COLLECTION_ID, TNB_API_KEY, payment_api_url]):
+                    if _should_log():
+                        logger.error('Missing TNB payment configuration: TNB_COLLECTION_ID=%s, TNB_API_KEY=%s, payment_api_url=%s', 
+                                   bool(TNB_COLLECTION_ID), bool(TNB_API_KEY), bool(payment_api_url))
+                    return "Payment service is currently unavailable. Please try again later."
+
+                # Get TNB payment details
+                total_amount = current_session['context'].get('pay_tnb_bill_total_amount', 0.0)
+                bill_count = current_session['context'].get('pay_tnb_bill_bill_count', 0)
+                bills_invoices = current_session['context'].get('pay_tnb_bill_bills_invoices', [])
                 
-                client_payment_confirm.close()
+                # Get account number from context
+                account_number = 'N/A'
+                selected_account = current_session['context'].get('selected_tnb_account')
+                if selected_account:
+                    account_number = selected_account
+                else:
+                    # Fallback to document extraction
+                    for key, doc_data in current_session['context'].items():
+                        if key.startswith('document_') and doc_data.get('isVerified') == 'verified':
+                            extracted_data = doc_data.get('extractedData', {})
+                            if extracted_data.get('account_number'):
+                                account_number = extracted_data['account_number']
+                                break
                 
-                return (
-                    f"**Payment Confirmation 💳**\n\n"
-                    f"**TNB Bill Payment Details:**\n"
-                    f"• Account No: {account_number}\n"
-                    f"• Bills to Pay: {bill_count}\n"
-                    f"• Total Amount: RM {total_amount:.2f}\n\n"
-                    f"Please confirm to proceed with payment. Reply **YES** to continue or **NO** to cancel. 😊"
-                )
-            except Exception:
-                return "Error retrieving payment details. Please try again."
-        elif workflow_state == 'payment_completed':
-            # Check if payment has been completed and generate receipt
+                if total_amount <= 0:
+                    return "Error: Invalid payment amount. Please try again."
+
+                payment_payload = {
+                    "user_id": user_id,
+                    "service_type": "pay_tnb_bill",
+                    "description": f"TNB Bill Payment - Account {account_number} ({bill_count} bill{'s' if bill_count > 1 else ''})",
+                    "amount": total_amount,
+                    "email": "no-reply@mygovhub.com",
+                    "name": "MyGovHub TNB Payment",
+                    "metadata": {
+                        "sessionId": current_session['sessionId'],
+                        "accountNumber": account_number,
+                        "billCount": bill_count,
+                        "invoiceNumbers": bills_invoices
+                    },
+                    "api_key": TNB_API_KEY,
+                    "collection_id": TNB_COLLECTION_ID
+                }
+                
+                # Call Billplz API to create payment bill
+                try:
+                    payment_response = requests.post(
+                        payment_api_url,
+                        json=payment_payload,
+                        headers={'Content-Type': 'application/json'},
+                        timeout=30
+                    )
+                    payment_response.raise_for_status()
+                    payment_result = payment_response.json()
+                    
+                    if not payment_result.get('url'):
+                        if _should_log():
+                            logger.error('TNB Payment API returned no URL: %s', payment_result)
+                        return "Failed to create payment. Please try again."
+                        
+                    # Create transaction record in MongoDB
+                    db_name = os.getenv('ATLAS_DB_NAME')
+                    if db_name:
+                        transactions_coll = client_payment[db_name]['transactions']
+                        transaction_doc = {
+                            "userId": user_id,
+                            "serviceType": service_name,
+                            "description": payment_payload['description'],
+                            "amount": payment_payload['amount'],
+                            "currency": "MYR",
+                            "status": "pending",
+                            "createdAt": datetime.now(timezone.utc).isoformat(),
+                            "updatedAt": datetime.now(timezone.utc).isoformat(),
+                            "metadata": payment_payload['metadata'],
+                            "billplz": {
+                                "url": payment_result['url']
+                            }
+                        }
+                        transactions_coll.insert_one(transaction_doc)
+
+                    # Update workflow state to payment_processing
+                    user_coll.update_one(
+                        {'sessionId': current_session['sessionId']},
+                        {'$set': {
+                            f'context.{service_name}_workflow_state': 'payment_processing',
+                            f'context.{service_name}_payment_url': payment_result['url']
+                        }}
+                    )
+                    
+                    client_payment.close()
+
+                    return (
+                        f"**💳 Payment Ready**\n\n"
+                        f"Your TNB bill payment of **RM {payment_payload['amount']:.2f}** is ready for processing.\n\n"
+                        f"Please click the link below to complete your payment:\n\n"
+                        f"🔗 **[Pay Now]({payment_result['url']})**\n\n"
+                        f"**Payment Details:**\n"
+                        f"• Account: {payment_payload['metadata'].get('accountNumber', 'N/A')}\n"
+                        f"• Bills: {payment_payload['metadata'].get('billCount', 0)}\n"
+                        f"• Amount: RM {payment_payload['amount']:.2f}\n\n"
+                        f"After completing the payment, send me any message and I'll check the status for you."
+                    )
+                    
+                except requests.RequestException as payment_e:
+                    if _should_log():
+                        logger.error('Failed to create Billplz payment: %s', str(payment_e))
+                    return "Payment service is currently unavailable. Please try again later."
+                    
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to process payment confirmation: %s', str(e))
+                return "An error occurred while processing your payment. Please try again."
+            finally:
+                try:
+                    client_payment.close()
+                except Exception:
+                    pass
+        elif workflow_state == 'payment_processing':
             payment_status = _check_payment_status(session_id, user_id)
             if payment_status and payment_status['status'] == 'paid':
-                # Payment confirmed! Generate receipt and show success message
+                # Payment confirmed! Update workflow state and show success message
                 try:
                     client_success = _connect_mongo()
                     chats_db = client_success['chats']
                     user_coll = chats_db[user_id]
                     
                     metadata = payment_status.get('metadata', {})
-                    amount = payment_status.get('amount', 0)
+                    total_amount = payment_status.get('amount', 0)
+                    bill_count = metadata.get('billCount', 0)
+                    bills_invoices = metadata.get('billsInvoices', [])
                     
+                    # Update the actual tnb-bills record in MongoDB licenses collection
+                    bills_update_success = False
+                    try:
+                        db_name = os.getenv('ATLAS_DB_NAME')
+                        if db_name:
+                            bills_coll = client_success[db_name]['tnb-bills']
+                            
+                            # Get current tnb-bills data from session context
+                            current_session = user_coll.find_one({'sessionId': session_id})
+                            bills_data = current_session.get('context', {}).get('database_bills', {})
+                            
+                            if bills_data:
+                                try:
+                                    update_result_count = 0
+                                    for bill in bills_data:
+                                        bill_data = bill.get('bill', {})
+                                        akaun = bill_data.get('akaun', {})
+                                        invoice_no = akaun.get('no_invois')
+                                        if invoice_no:
+                                            bills_coll.update_one(
+                                                {'bill.akaun.no_invois': invoice_no},
+                                                {'$set': {
+                                                    'status': 'paid',
+                                                    'pembayaran': {
+                                                        'jumlah': total_amount,
+                                                        'tarikh_bayar': datetime.now(timezone.utc).isoformat(),
+                                                        'kaedah': 'MyGovHub',
+                                                        'rujukan': str(metadata.get('sessionId', ''))
+                                                    }
+                                                }}
+                                            )
+                                            update_result_count += 1
+                                    
+                                    if update_result_count > 0:
+                                        bills_update_success = True
+                                        if _should_log():
+                                            logger.info('Updated %d TNB bills to paid status after payment', update_result_count)
+                                    else:
+                                        if _should_log():
+                                            logger.warning('No TNB bills updated after payment for sessionId=%s', session_id)
+                                
+                                except Exception as date_e:
+                                    if _should_log():
+                                        logger.error('Failed to update TNB bill dates/status: %s', str(date_e))
+
+                    except Exception as bills_e:
+                        if _should_log():
+                            logger.error('Failed to update TNB bills record after payment: %s', str(bills_e))
+
                     # Generate receipt for TNB bill payment
                     receipt_url = None
                     try:
-                        generate_receipt_api_url = os.getenv('GENERATE_RECEIPT_API_URL')
-                        if generate_receipt_api_url:
-                            # Get transaction data from MongoDB
-                            db_name = os.getenv('ATLAS_DB_NAME')
-                            if db_name:
-                                transactions_coll = client_success[db_name]['transactions']
-                                transaction = transactions_coll.find_one({
-                                    'userId': user_id,
-                                    'metadata.sessionId': session_id,
-                                    'status': 'paid'
-                                })
-                                
-                                if transaction:
-                                    # Get bill details from session context
-                                    current_session = user_coll.find_one({'sessionId': session_id})
-                                    bills_data = current_session.get('context', {}).get('database_bills', [])
+                        if service_name == 'pay_tnb_bill':
+                            generate_receipt_api_url = os.getenv('GENERATE_RECEIPT_API_URL')
+                            if generate_receipt_api_url:
+                                # Get transaction data from MongoDB
+                                db_name = os.getenv('ATLAS_DB_NAME')
+                                if db_name:
+                                    transactions_coll = client_success[db_name]['transactions']
+                                    transaction = transactions_coll.find_one({
+                                        'userId': user_id,
+                                        'metadata.sessionId': session_id,
+                                        'status': 'paid'
+                                    })
                                     
-                                    if bills_data:
-                                        # Use the first bill as the primary bill for receipt
-                                        primary_bill = bills_data[0]
+                                    if transaction:
+                                        # Get bill details from session context
+                                        current_session = user_coll.find_one({'sessionId': session_id})
+                                        bills_data = current_session.get('context', {}).get('database_bills', [])
+
+                                        if bills_data:
+                                            # Use the first bill as the primary bill for receipt
+                                            primary_bill = bills_data[0]
+                                            
+                                            # Prepare receipt request payload in TNB format
+                                            receipt_payload = {
+                                                "bill": primary_bill.get('bill', {}),
+                                                "status": "paid",
+                                                "pembayaran": {
+                                                    "jumlah": transaction.get('amount', total_amount),
+                                                    "tarikh_bayar": datetime.now(timezone.utc).strftime('%d-%m-%Y'),
+                                                    "kaedah": "Online",
+                                                    "rujukan": str(transaction.get('_id', ''))
+                                                },
+                                                "phone_number": "+60123456789"  # Default phone number
+                                            }
                                         
-                                        # Prepare receipt request payload in TNB format
-                                        receipt_payload = {
-                                            "bill": primary_bill.get('bill', {}),
-                                            "status": "paid",
-                                            "pembayaran": {
-                                                "jumlah": transaction.get('amount', amount),
-                                                "tarikh_bayar": datetime.now(timezone.utc).strftime('%d-%m-%Y'),
-                                                "kaedah": "Online",
-                                                "rujukan": str(transaction.get('_id', ''))
-                                            },
-                                            "phone_number": "+60123456789"  # Default phone number
-                                        }
-                                        
-                                        # Call receipt generation API
-                                        receipt_response = requests.post(
-                                            generate_receipt_api_url,
-                                            json=receipt_payload,
-                                            headers={'Content-Type': 'application/json'},
-                                            timeout=30
-                                        )
-                                        receipt_response.raise_for_status()
-                                        receipt_result = receipt_response.json()
-                                        
-                                        receipt_url = receipt_result.get('receipt_url')
-                                        if _should_log():
-                                            logger.info('TNB receipt generated successfully: %s', receipt_url)
+                                            # Call receipt generation API
+                                            receipt_response = requests.post(
+                                                generate_receipt_api_url,
+                                                json=receipt_payload,
+                                                headers={'Content-Type': 'application/json'},
+                                                timeout=30
+                                            )
+                                            receipt_response.raise_for_status()
+                                            receipt_result = receipt_response.json()
+                                            
+                                            receipt_url = receipt_result.get('receipt_url')
+                                            if _should_log():
+                                                logger.info('Receipt generated successfully for license renewal: %s', receipt_url)
                     except Exception as receipt_e:
                         if _should_log():
-                            logger.error('Failed to generate TNB receipt: %s', str(receipt_e))
+                            logger.error('Failed to generate receipt: %s', str(receipt_e))
                         # Continue without receipt - don't fail the payment completion
+
+                    # Update workflow state to completed
+                    user_coll.update_one(
+                        {'sessionId': session_id},
+                        {'$set': {
+                            f'context.{service_name}_workflow_state': 'payment_completed',
+                            'context.redirect_to_end_connection': True,
+                            'context.end_connection_reason': 'bill_payment_completed'
+                        }}
+                    )
                     
                     client_success.close()
-                    
+
                     success_message = (
                         f"**🎉 TNB Bill Payment Successful! 🎉**\n\n"
                         f"**Transaction Completed:**\n"
                         f"• Account No: {account_number}\n"
-                        f"• Amount Paid: RM {amount:.2f}\n\n"
+                        f"• Amount Paid: RM {total_amount:.2f}\n\n"
                         f"**Important:**\n"
                         f"• Your TNB bill payment has been successfully processed\n"
                         f"• You will receive a confirmation email shortly\n"
-                        f"• Please keep this transaction reference for your records\n"
+                        f"• Please keep this transaction reference for your records\n\n"
                     )
                     
                     # Add receipt URL if generated
                     if receipt_url:
-                        success_message += f"• 📄 **Receipt:** [Download PDF]({receipt_url})\n"
+                        success_message += f"📄 **Receipt:** [Download PDF]({receipt_url})\n"
+                    
+                    success_message += "\n"
+                    
+                    if not bills_update_success:
+                        success_message += (
+                            f"⚠️ **Note:** Payment completed but TNB bill record update may be delayed. "
+                            f"Please contact support if you don't see the payment reflected in your account within 24 hours.\n\n"
+                        )
                     
                     success_message += (
-                        f"\n\nThank you for using MyGovHub services! ⚡😊\n\n"
+                        f"Thank you for using MyGovHub services! 🆔😊\n\n"
                         f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
                         f"MyGovHub Support Team"
                     )
@@ -1132,13 +1306,21 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                         logger.error('Failed to process TNB payment completion: %s', str(e))
                     return "Payment completed but there was an error updating your records. Please contact support."
             else:
-                # Payment already completed - show completion message
+                # Payment still pending
                 return (
-                    f"**✅ TNB Payment Already Completed**\n\n"
-                    f"Your TNB bill payment has already been processed and completed successfully.\n\n"
-                    f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
-                    f"MyGovHub Support Team"
+                    f"**⏳ Payment Status: Pending**\n\n"
+                    f"Your payment is still being processed. Please complete the payment if you haven't already, "
+                    f"then send me another message to check the status again.\n\n"
+                    f"If you've already paid and this message persists, please wait a few minutes for the payment to be confirmed."
                 )
+        elif workflow_state == 'payment_completed':
+            # Payment already completed - show completion message
+            return (
+                f"**✅ TNB Payment Already Completed**\n\n"
+                f"Your TNB bill payment has already been processed and completed successfully.\n\n"
+                f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
+                f"MyGovHub Support Team"
+            )
         else:
             # First time or default - show bill info and ask for confirmation
             # Set workflow state to track that we've shown bills info
@@ -3707,7 +3889,36 @@ def lambda_handler(event, context):
                 pass
 
     # Check for service-specific confirmations (when service is active and user says yes) - HIGHEST PRIORITY
-    if active_service == 'renew_license' and _is_affirmative(message_lower) and not unverified_doc_key and not intent_type:
+    if active_service == 'pay_tnb_bill' and _is_affirmative(message_lower) and not unverified_doc_key and not intent_type:
+        # Check current workflow state for TNB bill payment
+        current_workflow_state = None
+        try:
+            client_check_state = _connect_mongo()
+            chats_db = client_check_state['chats']
+            user_coll = chats_db[user_id]
+            current_session = user_coll.find_one({'sessionId': session_id})
+            if current_session and current_session.get('context'):
+                current_workflow_state = current_session['context'].get(f'{active_service}_workflow_state')
+            client_check_state.close()
+        except Exception:
+            pass
+        
+        if current_workflow_state == 'tnb_bills_shown':
+            # User confirmed bill payment - update workflow state
+            try:
+                client_confirm = _connect_mongo()
+                chats_db = client_confirm['chats']
+                user_coll = chats_db[user_id]
+                user_coll.update_one(
+                    {'sessionId': session_id}, 
+                    {'$set': {f'context.{active_service}_workflow_state': 'bill_payment_confirmed'}}
+                )
+                intent_type = 'tnb_bills_confirmed'
+                client_confirm.close()
+            except Exception as e:
+                if _should_log():
+                    logger.error('Failed to update TNB workflow state: %s', str(e))
+    elif active_service == 'renew_license' and _is_affirmative(message_lower) and not unverified_doc_key and not intent_type:
         # Check current workflow state
         current_workflow_state = None
         try:
@@ -3734,6 +3945,35 @@ def lambda_handler(event, context):
             intent_type = f'{active_service}_payment_confirmed'
             if _should_log():
                 logger.info('User confirmed license renewal payment, updated workflow state')
+    
+    # Check for TNB service-specific confirmations
+    elif active_service == 'pay_tnb_bill' and _is_affirmative(message_lower) and not unverified_doc_key and not intent_type:
+        # Check current workflow state
+        current_workflow_state = None
+        try:
+            client_check_state = _connect_mongo()
+            chats_db = client_check_state['chats']
+            user_coll = chats_db[user_id]
+            session_current = new_session_generated if new_session_generated else session_id
+            current_session = user_coll.find_one({'sessionId': session_current})
+            if current_session and current_session.get('context'):
+                current_workflow_state = current_session['context'].get(f'{active_service}_workflow_state')
+            client_check_state.close()
+        except Exception:
+            pass
+        
+        if current_workflow_state == 'tnb_bills_shown':
+            # User confirmed TNB bill payment, update state
+            _update_service_workflow_state('tnb_bills_confirmed')
+            intent_type = 'tnb_bills_confirmed'
+            if _should_log():
+                logger.info('User confirmed TNB bill payment, updated workflow state')
+        elif current_workflow_state == 'tnb_bills_confirmed':
+            # User confirmed payment details, process the payment
+            _update_service_workflow_state('tnb_payment_confirmed')
+            intent_type = f'{active_service}_payment_confirmed'
+            if _should_log():
+                logger.info('User confirmed TNB payment, updated workflow state')
     
     # Check for service-specific cancellation (when service is active and user says no)
     elif active_service == 'renew_license' and _is_negative(message_lower) and not unverified_doc_key and not intent_type:
@@ -4113,290 +4353,6 @@ def lambda_handler(event, context):
             except Exception as e:
                 if _should_log():
                     logger.error('Failed to cancel TNB bill payment workflow: %s', str(e))
-    
-    # Handle payment confirmation for TNB bills
-    if intent_type == f'{active_service}_payment_confirmed' and active_service == 'pay_tnb_bill':
-        # Process TNB payment through Billplz API
-        try:
-            client_payment = _connect_mongo()
-            chats_db = client_payment['chats']
-            user_coll = chats_db[user_id]
-            session_current = new_session_generated if new_session_generated else session_id
-            current_session = user_coll.find_one({'sessionId': session_current})
-
-            if not current_session:
-                return _cors_response(400, {'error': 'Session not found'})
-
-            TNB_COLLECTION_ID = os.getenv('TNB_COLLECTION_ID')
-            TNB_API_KEY = os.getenv('TNB_API_KEY')
-            payment_api_url = os.getenv('PAYMENT_CREATE_BILL_API_URL')
-            
-            if not all([TNB_COLLECTION_ID, TNB_API_KEY, payment_api_url]):
-                if _should_log():
-                    logger.error('Missing TNB payment configuration')
-                return _cors_response(400, {'error': 'Payment service unavailable'})
-
-            # Get TNB payment details
-            total_amount = current_session['context'].get(f'{active_service}_total_amount', 0.0)
-            bill_count = current_session['context'].get(f'{active_service}_bill_count', 0)
-            bill_invoices = current_session['context'].get(f'{active_service}_bills_invoices', [])
-            
-            # Get account number
-            account_number = current_session['context'].get('selected_tnb_account')
-            if not account_number:
-                # Fall back to document-extracted account
-                for key, doc_data in current_session['context'].items():
-                    if key.startswith('document_') and doc_data.get('isVerified') == 'verified':
-                        extracted_data = doc_data.get('extractedData', {})
-                        account_number = extracted_data.get('account_number')
-                        if account_number:
-                            break
-            
-            if not account_number or total_amount <= 0:
-                return _cors_response(400, {'error': 'Invalid payment details'})
-
-            payment_payload = {
-                "user_id": user_id,
-                "service_type": "pay_tnb_bill",
-                "description": f"TNB Bill Payment - Account {account_number}",
-                "amount": total_amount,
-                "email": "no-reply@mygovhub.com",
-                "name": "MyGovHub TNB Payment",
-                "metadata": {
-                    "sessionId": session_current,
-                    "accountNumber": account_number,
-                    "billCount": bill_count,
-                    "billInvoices": bill_invoices
-                },
-                "api_key": TNB_API_KEY,
-                "collection_id": TNB_COLLECTION_ID
-            }
-            
-            # Call Billplz API to create payment bill
-            try:
-                payment_response = requests.post(
-                    payment_api_url,
-                    json=payment_payload,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=30
-                )
-                payment_response.raise_for_status()
-                payment_result = payment_response.json()
-                
-                if not payment_result.get('url'):
-                    if _should_log():
-                        logger.error('TNB Payment API returned no URL: %s', payment_result)
-                    return _cors_response(400, {'error': 'Failed to create payment'})
-                    
-                # Create transaction record in MongoDB
-                db_name = os.getenv('ATLAS_DB_NAME')
-                if db_name:
-                    transactions_coll = client_payment[db_name]['transactions']
-                    transaction_doc = {
-                        "userId": user_id,
-                        "serviceType": active_service,
-                        "description": payment_payload['description'],
-                        "amount": payment_payload['amount'],
-                        "currency": "MYR",
-                        "status": "pending",
-                        "createdAt": datetime.now(timezone.utc).isoformat(),
-                        "updatedAt": datetime.now(timezone.utc).isoformat(),
-                        "metadata": payment_payload['metadata'],
-                        "billplz": {
-                            "url": payment_result['url']
-                        }
-                    }
-                    transactions_coll.insert_one(transaction_doc)
-                
-                # Update workflow state to payment_processing
-                user_coll.update_one(
-                    {'sessionId': session_current},
-                    {'$set': {
-                        f'context.{active_service}_workflow_state': 'payment_processing',
-                        f'context.{active_service}_payment_url': payment_result['url']
-                    }}
-                )
-                
-                payment_message = (
-                    f"**💳 Payment Ready**\n\n"
-                    f"Your TNB bill payment of **RM {payment_payload['amount']:.2f}** is ready for processing.\n\n"
-                    f"Please click the link below to complete your payment:\n\n"
-                    f"🔗 **[Pay Now]({payment_result['url']})**\n\n"
-                    f"After completing the payment, send me any message and I'll check the status for you.\n\n"
-                    f"**Payment Details:**\n"
-                    f"• Account: {payment_payload['metadata'].get('accountNumber', 'N/A')}\n"
-                    f"• Bills: {payment_payload['metadata'].get('billCount', 0)}\n"
-                    f"• Amount: RM {payment_payload['amount']:.2f}"
-                )
-                
-                resp_body = {
-                    'status': {'statusCode': 200, 'message': 'Success'},
-                    'data': {
-                        'messageId': message_id,
-                        'message': payment_message,
-                        'createdAt': created_at_z,
-                        'sessionId': session_current,
-                        'attachment': attachments,
-                        'intent_type': 'payment_url_provided'
-                    }
-                }
-                client_payment.close()
-                return _cors_response(200, resp_body)
-                
-            except requests.RequestException as payment_e:
-                if _should_log():
-                    logger.error('Failed to create TNB Billplz payment: %s', str(payment_e))
-                return _cors_response(400, {'error': 'Payment service unavailable'})
-                
-        except Exception as e:
-            if _should_log():
-                logger.error('Failed to process TNB payment confirmation: %s', str(e))
-            return _cors_response(500, {'error': 'Payment processing failed'})
-        finally:
-            try:
-                client_payment.close()
-            except Exception:
-                pass
-
-    # Check for payment status updates for TNB bills
-    if active_service == 'pay_tnb_bill' and session_doc:
-        workflow_state = session_doc.get('context', {}).get(f'{active_service}_workflow_state')
-        if workflow_state == 'payment_processing':
-            # Check if payment has been completed
-            payment_status = _check_payment_status(session_id, user_id)
-            if payment_status and payment_status['status'] == 'paid':
-                # Payment confirmed! Update workflow state and show success message
-                try:
-                    client_success = _connect_mongo()
-                    chats_db = client_success['chats']
-                    user_coll = chats_db[user_id]
-                    
-                    # Generate receipt for TNB bill payment
-                    receipt_url = None
-                    try:
-                        if active_service == 'pay_tnb_bill':
-                            generate_receipt_api_url = os.getenv('GENERATE_RECEIPT_API_URL')
-                            if generate_receipt_api_url:
-                                # Get transaction data from MongoDB
-                                db_name = os.getenv('ATLAS_DB_NAME')
-                                if db_name:
-                                    transactions_coll = client_success[db_name]['transactions']
-                                    transaction = transactions_coll.find_one({
-                                        'userId': user_id,
-                                        'metadata.sessionId': session_id,
-                                        'status': 'paid'
-                                    })
-                                    
-                                    if transaction:
-                                        # Prepare receipt request payload
-                                        receipt_payload = {
-                                            "_id": str(transaction.get('_id', '')),
-                                            "userId": transaction.get('userId', user_id),
-                                            "serviceType": "TNB_BILL_PAYMENT",
-                                            "description": transaction.get('description', f"TNB Bill Payment for {bill_count} bill(s)"),
-                                            "amount": transaction.get('amount', amount),
-                                            "currency": transaction.get('currency', 'MYR'),
-                                            "status": "paid",
-                                            "createdAt": transaction.get('createdAt', ''),
-                                            "updatedAt": transaction.get('updatedAt', ''),
-                                            "billplz": transaction.get('billplz', {}),
-                                            "metadata": {
-                                                "sessionId": session_id,
-                                                "accountNumber": account_number,
-                                                "billCount": bill_count
-                                            }
-                                        }
-                                        
-                                        # Call receipt generation API
-                                        receipt_response = requests.post(
-                                            generate_receipt_api_url,
-                                            json=receipt_payload,
-                                            headers={'Content-Type': 'application/json'},
-                                            timeout=30
-                                        )
-                                        receipt_response.raise_for_status()
-                                        receipt_result = receipt_response.json()
-                                        
-                                        receipt_url = receipt_result.get('receipt_url')
-                                        if _should_log():
-                                            logger.info('Receipt generated successfully for TNB bill payment: %s', receipt_url)
-                    except Exception as receipt_e:
-                        if _should_log():
-                            logger.error('Failed to generate receipt: %s', str(receipt_e))
-                        # Continue without receipt - don't fail the payment completion
-
-                    user_coll.update_one(
-                        {'sessionId': session_id},
-                        {'$set': {
-                            f'context.{active_service}_workflow_state': 'payment_completed',
-                            'context.redirect_to_end_connection': True,
-                            'context.end_connection_reason': 'tnb_payment_completed'
-                        }}
-                    )
-                    
-                    metadata = payment_status.get('metadata', {})
-                    account_number = metadata.get('accountNumber', 'N/A')
-                    bill_count = metadata.get('billCount', 0)
-                    amount = payment_status.get('amount', 0)
-                    
-                    success_message = (
-                        f"**🎉 TNB Payment Successful! 🎉**\n\n"
-                        f"**Transaction Completed:**\n"
-                        f"• Account No: {account_number}\n"
-                        f"• Bills Paid: {bill_count}\n"
-                        f"• Total Amount: RM {amount:.2f}\n\n"
-                        f"**Important:**\n"
-                        f"• All outstanding bills have been paid\n"
-                        f"• You will receive a confirmation email shortly\n"
-                        f"• Please keep this transaction reference for your records\n"
-                    )
-                    
-                    # Add receipt URL if generated
-                    if receipt_url:
-                        success_message += (
-                            f"• 📄 **Receipt:** [Download PDF]({receipt_url})\n"
-                            f"Thank you for using MyGovHub services! ⚡😊\n\n"
-                            f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
-                            f"MyGovHub Support Team"
-                        )
-                    
-                    resp_body = {
-                        'status': {'statusCode': 200, 'message': 'Success'},
-                        'data': {
-                            'messageId': message_id,
-                            'message': success_message,
-                            'createdAt': created_at_z,
-                            'sessionId': session_id,
-                            'attachment': [{'url': receipt_url, 'name': 'receipt.pdf', 'type': 'application/pdf'}] if receipt_url else attachments,
-                            'intent_type': 'payment_success'
-                        }
-                    }
-                    
-                    client_success.close()
-                    return _cors_response(200, resp_body)
-                    
-                except Exception as e:
-                    if _should_log():
-                        logger.error('Failed to update TNB payment success status: %s', str(e))
-                    return _cors_response(500, {'error': 'Failed to update payment status'})
-            else:
-                # Payment still pending
-                return _cors_response(200, {
-                    'status': {'statusCode': 200, 'message': 'Success'},
-                    'data': {
-                        'messageId': message_id,
-                        'message': (
-                            f"**⏳ Payment Status: Pending**\n\n"
-                            f"Your TNB bill payment is still being processed. Please complete the payment if you haven't already, "
-                            f"then send me another message to check the status again.\n\n"
-                            f"If you've already paid and this message persists, please wait a few minutes for the payment to be confirmed."
-                        ),
-                        'createdAt': created_at_z,
-                        'sessionId': session_id,
-                        'attachment': attachments,
-                        'intent_type': 'payment_pending'
-                    }
-                })
 
     # Check for confirming_end_connection and end_connection intents
     if not intent_type and session_doc and session_doc.get('context', {}).get('redirect_to_end_connection'):
