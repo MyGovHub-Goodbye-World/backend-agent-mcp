@@ -321,13 +321,17 @@ def _check_payment_status(session_id: str, user_id: str) -> dict:
             'userId': user_id,
             'metadata.sessionId': session_id,
             'status': 'paid'
+        }) or transactions_coll.find_one({
+            'userId': user_id,
+            'metadata.sessionId': session_id,
+            'status': 'failed'
         })
         
         client.close()
         
         if transaction:
             return {
-                'status': 'paid',
+                'status': transaction.get('status'),
                 'amount': transaction.get('amount', 0),
                 'billplz': transaction.get('billplz', {}),
                 'metadata': transaction.get('metadata', {})
@@ -834,6 +838,29 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     if _should_log():
                         logger.error('Failed to update payment success status: %s', str(e))
                     return "Payment completed but there was an error updating your records. Please contact support."
+            elif payment_status and payment_status['status'] == 'failed':
+                # Payment failed - set workflow state to payment_failed and ask user if they want to retry
+                try:
+                    client_payment_failed = _connect_mongo()
+                    chats_db = client_payment_failed['chats']
+                    user_coll = chats_db[user_id]
+                    user_coll.update_one(
+                        {'sessionId': session_id},
+                        {'$set': {f'context.{service_name}_workflow_state': 'payment_failed'}}
+                    )
+                    client_payment_failed.close()
+                except Exception as e:
+                    if _should_log():
+                        logger.error('Failed to set payment_failed workflow state: %s', str(e))
+                
+                return (
+                    f"**❌ Payment Failed**\n\n"
+                    f"Your payment could not be processed. This may be due to insufficient funds, card issues, or network problems.\n\n"
+                    f"Would you like to:\n"
+                    f"• **TRY AGAIN** - Retry the payment\n"
+                    f"• **CANCEL** - Cancel this transaction\n\n"
+                    f"Please reply with **TRY AGAIN** or **CANCEL**."
+                )
             else:
                 # Payment still pending
                 return (
@@ -1377,6 +1404,29 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     if _should_log():
                         logger.error('Failed to process TNB payment completion: %s', str(e))
                     return "Payment completed but there was an error updating your records. Please contact support."
+            elif payment_status and payment_status['status'] == 'failed':
+                # Payment failed - set workflow state to payment_failed and ask user if they want to retry
+                try:
+                    client_payment_failed = _connect_mongo()
+                    chats_db = client_payment_failed['chats']
+                    user_coll = chats_db[user_id]
+                    user_coll.update_one(
+                        {'sessionId': session_id},
+                        {'$set': {f'context.{service_name}_workflow_state': 'payment_failed'}}
+                    )
+                    client_payment_failed.close()
+                except Exception as e:
+                    if _should_log():
+                        logger.error('Failed to set payment_failed workflow state: %s', str(e))
+                
+                return (
+                    f"**❌ Payment Failed**\n\n"
+                    f"Your payment could not be processed. This may be due to insufficient funds, card issues, or network problems.\n\n"
+                    f"Would you like to:\n"
+                    f"• **TRY AGAIN** - Retry the payment\n"
+                    f"• **CANCEL** - Cancel this transaction\n\n"
+                    f"Please reply with **TRY AGAIN** or **CANCEL**."
+                )
             else:
                 # Payment still pending
                 return (
@@ -3959,6 +4009,83 @@ def lambda_handler(event, context):
                 client_refetch.close()
             except Exception:
                 pass
+
+    # Check for payment failure retry/cancel responses - HIGHEST PRIORITY (before service intent detection)
+    if active_service and message_lower in ['try again', 'cancel'] and not intent_type:
+        # Check current workflow state
+        current_workflow_state = None
+        try:
+            client_check_state = _connect_mongo()
+            chats_db = client_check_state['chats']
+            user_coll = chats_db[user_id]
+            session_current = new_session_generated if new_session_generated else session_id
+            current_session = user_coll.find_one({'sessionId': session_current})
+            if current_session and current_session.get('context'):
+                current_workflow_state = current_session['context'].get(f'{active_service}_workflow_state')
+            client_check_state.close()
+        except Exception:
+            pass
+        
+        if current_workflow_state == 'payment_failed':
+            if message_lower == 'try again':
+                # User wants to retry payment - reset to payment confirmation state to trigger new payment creation
+                try:
+                    client_retry = _connect_mongo()
+                    chats_db = client_retry['chats']
+                    user_coll = chats_db[user_id]
+                    session_current = new_session_generated if new_session_generated else session_id
+                    
+                    # Set back to confirmation state to trigger new payment creation
+                    if active_service == 'renew_license':
+                        confirmation_state = 'license_payment_confirmed'
+                    elif active_service == 'pay_tnb_bill':
+                        confirmation_state = 'bill_payment_confirmed'
+                    else:
+                        confirmation_state = 'payment_processing'  # fallback
+                    
+                    user_coll.update_one(
+                        {'sessionId': session_current}, 
+                        {'$set': {
+                            f'context.{active_service}_workflow_state': confirmation_state
+                        }}
+                    )
+                    
+                    if _should_log():
+                        logger.info('User chose to retry payment, updated workflow state to %s', confirmation_state)
+                    
+                    # Set intent to trigger payment processing
+                    intent_type = f'{active_service}_payment_retry'
+                    
+                    client_retry.close()
+                except Exception as e:
+                    if _should_log():
+                        logger.error('Failed to update workflow state for payment retry: %s', str(e))
+            elif message_lower == 'cancel':
+                # User wants to cancel - end the service workflow
+                try:
+                    client_cancel = _connect_mongo()
+                    chats_db = client_cancel['chats']
+                    user_coll = chats_db[user_id]
+                    session_current = new_session_generated if new_session_generated else session_id
+                    
+                    user_coll.update_one(
+                        {'sessionId': session_current}, 
+                        {'$set': {
+                            f'context.{active_service}_workflow_state': 'action_cancelled',
+                            'status': 'cancelled'
+                        }}
+                    )
+                    
+                    # Set intent type to force connection end
+                    intent_type = 'force_end_connection'
+                    
+                    if _should_log():
+                        logger.info('User chose to cancel payment, marked session as cancelled')
+                    
+                    client_cancel.close()
+                except Exception as e:
+                    if _should_log():
+                        logger.error('Failed to cancel payment workflow: %s', str(e))
 
     # Check for service-specific confirmations (when service is active and user says yes) - HIGHEST PRIORITY
     if active_service == 'pay_tnb_bill' and _is_affirmative(message_lower) and not unverified_doc_key and not intent_type:
