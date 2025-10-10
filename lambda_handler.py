@@ -5,8 +5,6 @@ from datetime import datetime, timezone
 import traceback
 import base64
 import requests
-
-
 import boto3
 from botocore.exceptions import ClientError
 import logging
@@ -563,26 +561,6 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                         if _should_log():
                             logger.error('Payment API returned no URL: %s', payment_result)
                         return "Failed to create payment. Please try again."
-                        
-                    # Create transaction record in MongoDB
-                    db_name = os.getenv('ATLAS_DB_NAME')
-                    if db_name:
-                        transactions_coll = client_payment[db_name]['transactions']
-                        transaction_doc = {
-                            "userId": user_id,
-                            "serviceType": service_name,
-                            "description": payment_payload['description'],
-                            "amount": payment_payload['amount'],
-                            "currency": "MYR",
-                            "status": "pending",
-                            "createdAt": datetime.now(timezone.utc).isoformat(),
-                            "updatedAt": datetime.now(timezone.utc).isoformat(),
-                            "metadata": payment_payload['metadata'],
-                            "billplz": {
-                                "url": payment_result['url']
-                            }
-                        }
-                        transactions_coll.insert_one(transaction_doc)
 
                     # Update workflow state to payment_processing
                     user_coll.update_one(
@@ -1195,26 +1173,6 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                         if _should_log():
                             logger.error('TNB Payment API returned no URL: %s', payment_result)
                         return "Failed to create payment. Please try again."
-                        
-                    # Create transaction record in MongoDB
-                    db_name = os.getenv('ATLAS_DB_NAME')
-                    if db_name:
-                        transactions_coll = client_payment[db_name]['transactions']
-                        transaction_doc = {
-                            "userId": user_id,
-                            "serviceType": service_name,
-                            "description": payment_payload['description'],
-                            "amount": payment_payload['amount'],
-                            "currency": "MYR",
-                            "status": "pending",
-                            "createdAt": datetime.now(timezone.utc).isoformat(),
-                            "updatedAt": datetime.now(timezone.utc).isoformat(),
-                            "metadata": payment_payload['metadata'],
-                            "billplz": {
-                                "url": payment_result['url']
-                            }
-                        }
-                        transactions_coll.insert_one(transaction_doc)
 
                     # Update workflow state to payment_processing
                     user_coll.update_one(
