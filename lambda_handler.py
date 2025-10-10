@@ -640,6 +640,60 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                         if _should_log():
                             logger.error('Failed to update license record after payment: %s', str(license_e))
 
+                    # Generate receipt for license renewal payment
+                    receipt_url = None
+                    try:
+                        if service_name == 'renew_license':
+                            generate_receipt_api_url = os.getenv('GENERATE_RECEIPT_API_URL')
+                            if generate_receipt_api_url:
+                                # Get transaction data from MongoDB
+                                db_name = os.getenv('ATLAS_DB_NAME')
+                                if db_name:
+                                    transactions_coll = client_success[db_name]['transactions']
+                                    transaction = transactions_coll.find_one({
+                                        'userId': user_id,
+                                        'metadata.sessionId': session_id,
+                                        'status': 'paid'
+                                    })
+                                    
+                                    if transaction:
+                                        # Prepare receipt request payload
+                                        receipt_payload = {
+                                            "_id": str(transaction.get('_id', '')),
+                                            "userId": transaction.get('userId', user_id),
+                                            "serviceType": "LICENSE_RENEWAL",
+                                            "description": transaction.get('description', f"License Renewal for {renewal_years} year(s)"),
+                                            "amount": transaction.get('amount', amount),
+                                            "currency": transaction.get('currency', 'MYR'),
+                                            "status": "paid",
+                                            "createdAt": transaction.get('createdAt', ''),
+                                            "updatedAt": transaction.get('updatedAt', ''),
+                                            "billplz": transaction.get('billplz', {}),
+                                            "metadata": {
+                                                "sessionId": session_id,
+                                                "renewalYears": renewal_years,
+                                                "licenseNumber": license_number
+                                            }
+                                        }
+                                        
+                                        # Call receipt generation API
+                                        receipt_response = requests.post(
+                                            generate_receipt_api_url,
+                                            json=receipt_payload,
+                                            headers={'Content-Type': 'application/json'},
+                                            timeout=30
+                                        )
+                                        receipt_response.raise_for_status()
+                                        receipt_result = receipt_response.json()
+                                        
+                                        receipt_url = receipt_result.get('receipt_url')
+                                        if _should_log():
+                                            logger.info('Receipt generated successfully for license renewal: %s', receipt_url)
+                    except Exception as receipt_e:
+                        if _should_log():
+                            logger.error('Failed to generate receipt: %s', str(receipt_e))
+                        # Continue without receipt - don't fail the payment completion
+
                     # Update workflow state to completed
                     user_coll.update_one(
                         {'sessionId': session_id},
@@ -661,8 +715,14 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                         f"**Important:**\n"
                         f"• Your license has been successfully renewed\n"
                         f"• You will receive a confirmation email shortly\n"
-                        f"• Please keep this transaction reference for your records\n\n"
+                        f"• Please keep this transaction reference for your records\n"
                     )
+                    
+                    # Add receipt URL if generated
+                    if receipt_url:
+                        success_message += f"• 📄 **Receipt:** [Download PDF]({receipt_url})\n"
+                    
+                    success_message += "\n"
                     
                     if not license_update_success:
                         success_message += (
@@ -4114,6 +4174,60 @@ def lambda_handler(event, context):
                     chats_db = client_success['chats']
                     user_coll = chats_db[user_id]
                     
+                    # Generate receipt for TNB bill payment
+                    receipt_url = None
+                    try:
+                        if active_service == 'pay_tnb_bill':
+                            generate_receipt_api_url = os.getenv('GENERATE_RECEIPT_API_URL')
+                            if generate_receipt_api_url:
+                                # Get transaction data from MongoDB
+                                db_name = os.getenv('ATLAS_DB_NAME')
+                                if db_name:
+                                    transactions_coll = client_success[db_name]['transactions']
+                                    transaction = transactions_coll.find_one({
+                                        'userId': user_id,
+                                        'metadata.sessionId': session_id,
+                                        'status': 'paid'
+                                    })
+                                    
+                                    if transaction:
+                                        # Prepare receipt request payload
+                                        receipt_payload = {
+                                            "_id": str(transaction.get('_id', '')),
+                                            "userId": transaction.get('userId', user_id),
+                                            "serviceType": "TNB_BILL_PAYMENT",
+                                            "description": transaction.get('description', f"TNB Bill Payment for {bill_count} bill(s)"),
+                                            "amount": transaction.get('amount', amount),
+                                            "currency": transaction.get('currency', 'MYR'),
+                                            "status": "paid",
+                                            "createdAt": transaction.get('createdAt', ''),
+                                            "updatedAt": transaction.get('updatedAt', ''),
+                                            "billplz": transaction.get('billplz', {}),
+                                            "metadata": {
+                                                "sessionId": session_id,
+                                                "accountNumber": account_number,
+                                                "billCount": bill_count
+                                            }
+                                        }
+                                        
+                                        # Call receipt generation API
+                                        receipt_response = requests.post(
+                                            generate_receipt_api_url,
+                                            json=receipt_payload,
+                                            headers={'Content-Type': 'application/json'},
+                                            timeout=30
+                                        )
+                                        receipt_response.raise_for_status()
+                                        receipt_result = receipt_response.json()
+                                        
+                                        receipt_url = receipt_result.get('receipt_url')
+                                        if _should_log():
+                                            logger.info('Receipt generated successfully for TNB bill payment: %s', receipt_url)
+                    except Exception as receipt_e:
+                        if _should_log():
+                            logger.error('Failed to generate receipt: %s', str(receipt_e))
+                        # Continue without receipt - don't fail the payment completion
+
                     user_coll.update_one(
                         {'sessionId': session_id},
                         {'$set': {
@@ -4137,11 +4251,17 @@ def lambda_handler(event, context):
                         f"**Important:**\n"
                         f"• All outstanding bills have been paid\n"
                         f"• You will receive a confirmation email shortly\n"
-                        f"• Please keep this transaction reference for your records\n\n"
-                        f"Thank you for using MyGovHub services! ⚡😊\n\n"
-                        f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
-                        f"MyGovHub Support Team"
+                        f"• Please keep this transaction reference for your records\n"
                     )
+                    
+                    # Add receipt URL if generated
+                    if receipt_url:
+                        success_message += (
+                            f"• 📄 **Receipt:** [Download PDF]({receipt_url})\n"
+                            f"Thank you for using MyGovHub services! ⚡😊\n\n"
+                            f"Is there anything else I can help you with today? Reply **YES** if you need other services, or **NO** to end our session.\n\n"
+                            f"MyGovHub Support Team"
+                        )
                     
                     resp_body = {
                         'status': {'statusCode': 200, 'message': 'Success'},
