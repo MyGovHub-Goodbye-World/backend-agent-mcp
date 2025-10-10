@@ -4270,7 +4270,7 @@ def lambda_handler(event, context):
                             'message': success_message,
                             'createdAt': created_at_z,
                             'sessionId': session_id,
-                            'attachment': attachments,
+                            'attachment': [{'url': receipt_url, 'name': 'receipt.pdf', 'type': 'application/pdf'}] if receipt_url else attachments,
                             'intent_type': 'payment_success'
                         }
                     }
@@ -5206,6 +5206,14 @@ def lambda_handler(event, context):
                 'attachment': body.get('attachment') or []
             }
         }
+        
+        # Add receipt URL to attachment field if present in response message
+        if response_text and 'Download PDF](' in response_text:
+            import re
+            receipt_match = re.search(r'\[Download PDF\]\(([^)]+)\)', response_text)
+            if receipt_match:
+                receipt_url = receipt_match.group(1)
+                resp_body['data']['attachment'] = [{'url': receipt_url, 'name': 'receipt.pdf', 'type': 'application/pdf'}]
 
         if intent_type:
             resp_body['data']['intent_type'] = intent_type
