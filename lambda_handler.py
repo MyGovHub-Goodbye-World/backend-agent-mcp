@@ -244,6 +244,62 @@ def _service_requirements_met(service_name: str, session_doc: dict, ekyc_data: d
     return False
 
 
+def _generate_license(license_data: dict, phone_number: str = "+60123456789", customer_name: str = "Customer") -> dict:
+    """Generate license using LICENSE_GENERATOR_API_URL.
+    
+    Args:
+        license_data: License data containing full_name, license_number, etc.
+        phone_number: Customer phone number
+        customer_name: Customer name
+        
+    Returns:
+        dict: License generation result or None if generation fails
+    """
+    try:
+        license_api_url = os.getenv('LICENSE_GENERATOR_API_URL')
+        if not license_api_url:
+            if _should_log():
+                logger.error('LICENSE_GENERATOR_API_URL environment variable is not set')
+            return None
+        
+        # Prepare license generation payload
+        payload = {
+            "template_type": "lesen",
+            "data": {
+                "full_name": license_data.get('full_name', 'N/A'),
+                "license_number": license_data.get('license_number', 'N/A'),
+                "date_of_birth": license_data.get('date_of_birth', '01/01/1990'),
+                "valid_from": license_data.get('valid_from', '01/01/2022'),
+                "valid_to": license_data.get('valid_to', '01/01/2027'),
+                "license_classes": license_data.get('license_classes', ["B"]),
+                "status": license_data.get('status', 'Active')
+            },
+            "phone_number": phone_number,
+            "customer_name": customer_name
+        }
+        
+        # Call license generation API
+        response = requests.post(
+            license_api_url,
+            json=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if _should_log():
+            logger.info('License generated successfully: %s', result.get('license_url', 'No URL'))
+        
+        return result
+        
+    except Exception as e:
+        if _should_log():
+            logger.error('Failed to generate license: %s', str(e))
+        return None
+
+
 def _check_payment_status(session_id: str, user_id: str) -> dict:
     """Check payment status in MongoDB transactions collection.
     
@@ -694,6 +750,60 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                             logger.error('Failed to generate receipt: %s', str(receipt_e))
                         # Continue without receipt - don't fail the payment completion
 
+                    # Generate new license document
+                    license_url = None
+                    try:
+                        if service_name == 'renew_license' and license_update_success:
+                            # Get updated license data from session context
+                            current_session = user_coll.find_one({'sessionId': session_id})
+                            license_data = current_session.get('context', {}).get('database_license', {})
+                            
+                            if license_data:
+                                # Calculate new expiry date for license generation
+                                current_valid_to = license_data.get('valid_to')
+                                if current_valid_to:
+                                    try:
+                                        if isinstance(current_valid_to, str):
+                                            current_expiry = datetime.fromisoformat(current_valid_to.replace('Z', '+00:00'))
+                                        else:
+                                            current_expiry = current_valid_to
+                                        
+                                        new_year = current_expiry.year + renewal_years
+                                        new_expiry = current_expiry.replace(year=new_year)
+                                        new_expiry_str = new_expiry.strftime('%d/%m/%Y')
+                                        
+                                        # Prepare license data for generation
+                                        license_gen_data = {
+                                            'full_name': license_data.get('full_name', 'N/A'),
+                                            'license_number': license_data.get('license_number', license_number),
+                                            'date_of_birth': license_data.get('date_of_birth', '15/07/1985'),
+                                            'valid_from': datetime.now().strftime('%d/%m/%Y'),
+                                            'valid_to': new_expiry_str,
+                                            'license_classes': license_data.get('license_classes', ['B']),
+                                            'status': 'Active'
+                                        }
+                                        
+                                        # Generate license
+                                        license_result = _generate_license(
+                                            license_gen_data,
+                                            phone_number="+60123456789",
+                                            customer_name=license_data.get('full_name', 'Customer')
+                                        )
+                                        
+                                        if license_result:
+                                            license_url = license_result.get('license_url')
+                                            if _should_log():
+                                                logger.info('License generated successfully: %s', license_url)
+                                        
+                                    except Exception as date_e:
+                                        if _should_log():
+                                            logger.error('Failed to calculate license dates for generation: %s', str(date_e))
+                                            
+                    except Exception as license_e:
+                        if _should_log():
+                            logger.error('Failed to generate license: %s', str(license_e))
+                        # Continue without license generation - don't fail the payment completion
+
                     # Update workflow state to completed
                     user_coll.update_one(
                         {'sessionId': session_id},
@@ -720,7 +830,11 @@ def _build_service_next_step_message(service_name: str, user_id: str, session_id
                     
                     # Add receipt URL if generated
                     if receipt_url:
-                        success_message += f"📄 **Receipt:** [Download PDF]({receipt_url})\n"
+                        success_message += f"📄 **Receipt:** [Download PDF]({receipt_url})\n\n"
+                    
+                    # Add license URL if generated
+                    if license_url:
+                        success_message += f"🆔 **New License:** [Download PDF]({license_url})\n"
                     
                     success_message += "\n"
                     
