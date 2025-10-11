@@ -1977,36 +1977,6 @@ def _parse_document_corrections(message: str, current_data: dict) -> dict:
     return corrections
 
 
-def _classify_intent_with_bedrock(msg):
-    """
-    Use Bedrock to classify user intent as SERVICE_INTENT, INQUERY, or OTHER.
-    SERVICE_INTENT: User wants to perform a government service (renew license, pay bill, etc.)
-    INQUERY: User is asking a general government-related question (Q&A, info, FAQ)
-    OTHER: Not related to government services or Q&A
-    """
-    prompt = (
-        "SYSTEM: You are an intent classifier for a government services chatbot. "
-        "Classify the user's message as one of the following INTENT_LABELS (respond with ONLY the label):\n"
-        "- SERVICE_INTENT: User wants to perform a government service (e.g., renew license, pay bill, apply permit, check status, get documents)\n"
-        "- INQUERY: User is asking a general government-related question, FAQ, or informational query (not a direct service command)\n"
-        "- OTHER: Not related to government services or Q&A\n\n"
-        "User message: '" + msg.strip() + "'\n\n"
-        "INTENT_LABEL:"
-    )
-    try:
-        result = run_agent(prompt, max_tokens=10, temperature=0.1, top_p=0.7).strip().upper()
-        if 'SERVICE_INTENT' in result:
-            return 'service_intent'
-        elif 'INQUERY' in result:
-            return 'inquery'
-        else:
-            return 'other'
-    except Exception as e:
-        if _should_log():
-            logger.error('Bedrock intent classifier failed: %s', str(e))
-        return 'other'
-
-
 def lambda_handler(event, context):
     """Handle new request format and return MCP-style response.
 
