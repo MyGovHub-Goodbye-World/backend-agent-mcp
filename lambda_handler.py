@@ -241,7 +241,6 @@ def _service_requirements_met(service_name: str, session_doc: dict, ekyc_data: d
                     return True
     return False
 
-
 def _generate_license(license_data: dict, phone_number: str = "+60123456789", customer_name: str = "Customer") -> dict:
     """Generate license using LICENSE_GENERATOR_API_URL.
     
@@ -296,7 +295,6 @@ def _generate_license(license_data: dict, phone_number: str = "+60123456789", cu
         if _should_log():
             logger.error('Failed to generate license: %s', str(e))
         return None
-
 
 def _check_payment_status(session_id: str, user_id: str) -> dict:
     """Check payment status in MongoDB transactions collection.
@@ -1625,6 +1623,7 @@ def _detect_service_intent(message_lower: str):
 
         return None, None
 
+
 def _connect_mongo():
     """Create a MongoDB client using ATLAS_URI from env.
 
@@ -1693,7 +1692,6 @@ def _process_document_attachment(attachment):
         if _should_log():
             logger.error('Failed to process document attachment: %s', str(e))
         return None
-
 
 def _save_document_context_to_session(user_id, session_id, ocr_result, attachment_name):
     """Save extracted document data to the session context in MongoDB.
@@ -1722,7 +1720,6 @@ def _save_document_context_to_session(user_id, session_id, ocr_result, attachmen
                 'extractedData': extracted_data,
                 'categoryDetection': category_detection,
                 'filename': attachment_name,
-                # Tri-state string: 'unverified' | 'correcting' | 'verified'
                 'isVerified': 'unverified'
             }
         }
@@ -1745,7 +1742,6 @@ def _save_document_context_to_session(user_id, session_id, ocr_result, attachmen
         except Exception:
             pass
 
-
 def _check_document_quality(ocr_result):
     """Check if document is blurry based on OCR analysis results.
     
@@ -1769,7 +1765,6 @@ def _check_document_quality(ocr_result):
         if _should_log():
             logger.error('Failed to check document quality: %s', str(e))
         return False, None
-
 
 def _generate_document_analysis_prompt(ocr_result, user_message):
     """Generate appropriate prompt for document processing based on category detection.
@@ -1860,394 +1855,6 @@ def _generate_document_analysis_prompt(ocr_result, user_message):
             logger.error('Failed to generate document analysis prompt: %s', str(e))
         # Fallback prompt
         return f"SYSTEM: Document processing completed. User message: {user_message}. Please provide assistance based on the uploaded document."
-
-
-def _parse_document_corrections(message: str, current_data: dict) -> dict:
-    """Parse user free-form correction text into field->value mapping.
-
-    Supports patterns like:
-      - "wrong, full name is lim wen hau"
-      - "full_name: LIM WEN HAU"
-      - "name should be LIM WEN HAU"
-      - "IC is 041223-07-0745"
-      - Multiple lines each containing a correction.
-
-    The parser is tolerant of punctuation and case. It attempts fuzzy matching
-    against existing keys in current_data and known synonyms. Returns only
-    fields that can be confidently matched.
-    """
-    import re
-    if not message or not current_data:
-        return {}
-
-    original_message = message
-    # Normalize spacing
-    message = re.sub(r"\s+", " ", message.strip())
-
-    # Lower copy for pattern detection while we keep original for value extraction
-    lower_msg = message.lower()
-
-    # Split into candidate segments (newline, ' and ', commas used as delimiters)
-    # Keep semicolons and periods as potential delimiters when followed by space
-    segments = re.split(r"[\n;,]+|\band\b", message, flags=re.IGNORECASE)
-
-    # Known synonym lists
-    synonyms = {
-        'full_name': ['full name', 'name', 'nama'],
-        'userId': ['ic', 'ic number', 'id number', 'id', 'userid', 'identity card'],
-        'gender': ['gender', 'sex', 'jantina'],
-        'address': ['address', 'alamat', 'location'],
-        'licenses_number': ['license', 'license number', 'lesen'],
-        'account_number': ['account', 'account number'],
-        'invoice_number': ['invoice', 'invoice number']
-    }
-
-    # Reverse map for quick lookup
-    synonym_to_field = {}
-    for field, words in synonyms.items():
-        for w in words:
-            synonym_to_field[w] = field
-
-    # Helper to resolve a raw field token to actual existing field
-    def resolve_field(token: str):
-        t = token.lower().strip(': ').strip()
-        # Exact existing key
-        for k in current_data.keys():
-            if t == k.lower():
-                return k
-        # Direct synonym
-        if t in synonym_to_field:
-            mapped = synonym_to_field[t]
-            # prefer existing key if present
-            for k in current_data.keys():
-                if k.lower() == mapped.lower():
-                    return k
-            return mapped
-        # Partial match within existing keys
-        for k in current_data.keys():
-            if t in k.lower() or k.lower() in t:
-                return k
-        return None
-
-    corrections = {}
-
-    # Pattern variants to attempt per segment
-    pattern_specs = [
-        # field: value
-        re.compile(r"^(?P<field>[A-Za-z_ ]{2,30})\s*[:=-]\s*(?P<value>.+)$"),
-        # field should be value
-        re.compile(r"^(?P<field>[A-Za-z_ ]{2,30})\s+should\s+be\s+(?P<value>.+)$", re.IGNORECASE),
-        # field is value
-        re.compile(r"^(?P<field>[A-Za-z_ ]{2,30})\s+is\s+(?P<value>.+)$", re.IGNORECASE),
-        # wrong, field is value OR wrong field is value
-        re.compile(r"^(?:wrong[, ]+)?(?P<field>[A-Za-z_ ]{2,30})\s+is\s+(?P<value>.+)$", re.IGNORECASE),
-        # fix field to value / change field to value / update field to value
-        re.compile(r"^(?:fix|change|update)\s+(?P<field>[A-Za-z_ ]{2,30})\s+(?:to|as)\s+(?P<value>.+)$", re.IGNORECASE),
-    ]
-
-    for raw_segment in segments:
-        segment = raw_segment.strip()
-        if not segment:
-            continue
-        # Remove leading qualifiers
-        segment = re.sub(r"^(wrong|no|not|incorrect)[, ]+", "", segment, flags=re.IGNORECASE)
-        matched = False
-        for pat in pattern_specs:
-            m = pat.match(segment)
-            if m:
-                field_token = m.group('field').strip()
-                value = m.group('value').strip()
-                resolved = resolve_field(field_token)
-                if resolved and value:
-                    corrections[resolved] = value
-                matched = True
-                break
-        if matched:
-            continue
-        # Heuristic: "full name is abc" inside longer sentence
-        for field_key in current_data.keys():
-            # Search pattern like '<synonym> is <value>'
-            for syn in [field_key] + synonyms.get(field_key, []):
-                syn_lower = syn.lower()
-                idx = segment.lower().find(f"{syn_lower} is ")
-                if idx != -1:
-                    val = segment[idx + len(syn_lower) + 4:].strip()
-                    if val:
-                        corrections[field_key] = val
-                        break
-
-    # Normalize whitespace of values
-    for k, v in list(corrections.items()):
-        corrections[k] = re.sub(r"\s+", " ", v).strip()
-
-    return corrections
-
-
-# Initialize logger for CloudWatch
-logger = logging.getLogger('lambda_handler')
-logger.setLevel(logging.INFO)
-
-
-def _should_log():
-    try:
-        return os.getenv('SHOW_CLOUDWATCH_LOGS', 'false').lower() in ('1', 'true', 'yes')
-    except Exception:
-        return False
-
-def _log_request(event, body_obj=None):
-    try:
-        request_context = event.get('requestContext', {})
-        http = request_context.get('http') or {}
-        path = http.get('path') if isinstance(http, dict) else event.get('rawPath') or event.get('path')
-        method = http.get('method') if isinstance(http, dict) else event.get('httpMethod')
-        log_obj = {
-            'path': path,
-            'method': method,
-        }
-        if body_obj is not None:
-            log_obj['body'] = body_obj
-        else:
-            log_obj['body'] = event.get('body')
-        if _should_log():
-            logger.info('Request received: %s', json.dumps(log_obj))
-    except Exception:
-        logger.exception('Failed to log request')
-
-def _connect_mongo():
-    """Create a MongoDB client using ATLAS_URI from env.
-
-    Raises RuntimeError if ATLAS_URI is missing or the connection cannot be established.
-    Returns a pymongo.MongoClient on success.
-    """
-    atlas_uri = os.getenv('ATLAS_URI') + '?retryWrites=true&w=majority'
-    if not atlas_uri:
-        raise RuntimeError('ATLAS_URI environment variable is not set')
-    try:
-        client = pymongo.MongoClient(atlas_uri, serverSelectionTimeoutMS=5000)
-        # attempt server selection
-        client.admin.command('ping')
-        return client
-    except Exception as e:
-        raise RuntimeError(f'Failed to connect to MongoDB: {e}')
-
-
-def _process_document_attachment(attachment):
-    """Process document attachment by calling OCR_ANALYZE_API_URL.
-    
-    Args:
-        attachment: dict with 'url' and 'name' fields
-        
-    Returns:
-        dict: OCR analysis result or None if processing fails
-    """
-    try:
-        ocr_api_url = os.getenv('OCR_ANALYZE_API_URL')
-        if not ocr_api_url:
-            raise RuntimeError('OCR_ANALYZE_API_URL environment variable is not set')
-        
-        # Fetch image from URL
-        response = requests.get(attachment['url'], timeout=30)
-        response.raise_for_status()
-        
-        # Convert to base64
-        file_content = base64.b64encode(response.content).decode('utf-8')
-        
-        # Prepare payload for OCR API
-        payload = {
-            'file_content': file_content,
-            'filename': attachment['name']
-        }
-        
-        # Call OCR API
-        ocr_response = requests.post(
-            ocr_api_url,
-            json=payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=60
-        )
-        ocr_response.raise_for_status()
-        
-        ocr_result = ocr_response.json()
-        
-        # Log OCR API response to CloudWatch
-        if _should_log():
-            logger.info('OCR API response for file %s: %s', 
-                       attachment['name'], 
-                       json.dumps(ocr_result, indent=2, default=str))
-        
-        return ocr_result
-        
-    except Exception as e:
-        if _should_log():
-            logger.error('Failed to process document attachment: %s', str(e))
-        return None
-
-
-def _save_document_context_to_session(user_id, session_id, ocr_result, attachment_name):
-    """Save extracted document data to the session context in MongoDB.
-    
-    Args:
-        user_id: User ID
-        session_id: Session ID
-        ocr_result: OCR analysis result
-        attachment_name: Original attachment filename
-    """
-    try:
-        client = _connect_mongo()
-        db = client['chats']
-        coll = db[user_id]
-        
-        # Prepare context data with extracted information
-        extracted_data = ocr_result.get('extracted_data', {})
-        category_detection = ocr_result.get('category_detection', {})
-        
-        # Sanitize filename to avoid MongoDB nested object issues (replace dots with underscores)
-        sanitized_filename = attachment_name.replace('.', '_')
-        
-        # Update the session document's context with extracted data
-        context_update = {
-            f'context.document_{sanitized_filename}': {
-                'extractedData': extracted_data,
-                'categoryDetection': category_detection,
-                'filename': attachment_name,  # Keep original filename for reference
-                'isVerified': 'unverified'  # Requires user verification before proceeding
-            }
-        }
-        
-        coll.update_one(
-            {'sessionId': session_id}, 
-            {'$set': context_update}
-        )
-        
-        if _should_log():
-            logger.info('Saved document context to session: user=%s session=%s filename=%s', 
-                       user_id, session_id, attachment_name)
-        
-    except Exception as e:
-        if _should_log():
-            logger.error('Failed to save document context to session: %s', str(e))
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
-
-
-def _check_document_quality(ocr_result):
-    """Check if document is blurry based on OCR analysis results.
-    
-    Args:
-        ocr_result: OCR analysis result dict
-        
-    Returns:
-        tuple: (is_blurry: bool, blur_message: str or None)
-    """
-    try:
-        blur_analysis = ocr_result.get('blur_analysis', {})
-        overall_assessment = blur_analysis.get('overall_assessment', {})
-        is_blurry = overall_assessment.get('is_blurry', False)
-        
-        if is_blurry:
-            return True, "The document image appears to be blurry or unclear. Please take a clearer photo and send the document again for better processing."
-        
-        return False, None
-        
-    except Exception as e:
-        if _should_log():
-            logger.error('Failed to check document quality: %s', str(e))
-        return False, None
-
-
-def _generate_document_analysis_prompt(ocr_result, user_message):
-    """Generate appropriate prompt for document processing based on category detection.
-    
-    Args:
-        ocr_result: OCR analysis result dict
-        user_message: Original user message
-        
-    Returns:
-        str: Generated prompt for the AI model
-    """
-    try:
-        category_detection = ocr_result.get('category_detection', {})
-        detected_category = category_detection.get('detected_category', 'unknown')
-        confidence = category_detection.get('confidence', 0)
-        
-        extracted_data = ocr_result.get('extracted_data', {})
-        text_content = ocr_result.get('text', [])
-        
-        # Extract meaningful text from OCR results
-        text_parts = []
-        for text_item in text_content:
-            if isinstance(text_item, dict) and text_item.get('text'):
-                text_parts.append(text_item['text'])
-        
-        extracted_text = ' '.join(text_parts) if text_parts else ''
-        
-        prompt_parts = [
-            f"SYSTEM: You are processing a document for a government services portal (MyGovHub).",
-            f"Document category detected: {detected_category} (confidence: {confidence:.2f})",
-            f"Intent type: document_processing",
-            f"NOTE: The 'userId' field represents the Identity Card (IC) number.",
-            ""
-        ]
-        
-        if extracted_data:
-            prompt_parts.append("Extracted structured data (show with user-friendly labels):")
-            # Field mapping for user-friendly display
-            field_mapping = {
-                'full_name': 'Full Name',
-                'userId': 'IC Number',
-                'gender': 'Gender', 
-                'address': 'Address',
-                'licenses_number': 'License Number',
-                'account_number': 'Account Number',
-                'invoice_number': 'Invoice Number'
-            }
-            
-            for key, value in extracted_data.items():
-                friendly_name = field_mapping.get(key, key.replace('_', ' ').title())
-                prompt_parts.append(f"- {friendly_name}: {value}")
-            prompt_parts.append("")
-        
-        if extracted_text:
-            prompt_parts.append(f"Document text content: {extracted_text[:1000]}...")  # Limit length
-            prompt_parts.append("")
-        
-        # Category-specific guidance
-        category_guidance = {
-            'receipt': "This appears to be a receipt. Help the user understand the transaction details and offer relevant government services like expense reporting or tax documentation.",
-            'invoice': "This appears to be an invoice. Assist with business registration, tax filing, or payment verification services.",
-            'license': "This appears to be a license document. Help with renewal processes, verification, or related permit applications.",
-            'permit': "This appears to be a permit document. Assist with permit renewals, status checks, or related applications.",
-            'identification': "This appears to be an identification document. Help with identity verification, document renewal, or related services.",
-            'bill': "This appears to be a utility or service bill. Assist with bill payment services or account verification.",
-            'form': "This appears to be a government form. Help with form completion, submission, or status tracking.",
-        }
-        
-        guidance = category_guidance.get(detected_category, "Analyze the document and provide relevant assistance based on the content.")
-        prompt_parts.append(f"Guidance: {guidance}")
-        prompt_parts.append("")
-        
-        if user_message.strip():
-            prompt_parts.append(f"User message: {user_message}")
-        else:
-            prompt_parts.append("User uploaded a document without additional message.")
-        prompt_parts.append("")
-        prompt_parts.append("IMPORTANT: Keep your response concise. Show ONLY the extracted key information in a simple format.")
-        prompt_parts.append("After showing the data, ask: 'Is this information correct? Please reply YES to confirm.'")
-        prompt_parts.append("Do not repeat the information multiple times or add lengthy explanations.")
-        prompt_parts.append("")
-        prompt_parts.append("NOTE: If you include a signature, use 'MyGovHub Support Team' only. Do not use placeholders like '[Your Name]' or similar.")
-        
-        return '\n'.join(prompt_parts)
-        
-    except Exception as e:
-        if _should_log():
-            logger.error('Failed to generate document analysis prompt: %s', str(e))
-        # Fallback prompt
-        return f"SYSTEM: Document processing completed. User message: {user_message}. Please provide assistance based on the uploaded document."
-
 
 def _parse_document_corrections(message: str, current_data: dict) -> dict:
     """Parse user free-form correction text into field->value mapping.
@@ -2398,6 +2005,7 @@ def _classify_intent_with_bedrock(msg):
         if _should_log():
             logger.error('Bedrock intent classifier failed: %s', str(e))
         return 'other'
+
 
 def lambda_handler(event, context):
     """Handle new request format and return MCP-style response.
