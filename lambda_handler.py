@@ -2435,7 +2435,7 @@ def lambda_handler(event, context):
         aff_tokens = {
             'yes', 'ya', 'y', 'ok', 'okay', 'true', 'benar', 'sure',
             'correct', 'accurate', 'looks good', 'betul', 'ya betul',
-            'setuju', 'confirm'
+            'setuju', 'confirm', 'yup', 'yess'
         }
         cleaned = msg.strip().lower()
         
@@ -2461,11 +2461,11 @@ def lambda_handler(event, context):
                     "SYSTEM: You are analyzing user messages to detect affirmative responses. "
                     "Determine if the message indicates agreement, confirmation, or acceptance.\n\n"
                     "AFFIRMATIVE INDICATORS:\n"
-                    "- Direct confirmations: 'yes', 'ya', 'ok', 'okay', 'sure', 'correct'\n"
+                    "- Direct confirmations: 'yes', 'ya', 'ok', 'okay', 'sure', 'correct', 'yup', 'yess'\n"
                     "- Agreement words: 'true', 'benar', 'betul', 'setuju', 'confirm'\n"
                     "- Positive phrases: 'looks good', 'that's right', 'sounds good'\n"
                     "- Language variations: 'ya betul', 'okay lah', 'yes please'\n"
-                    "- With punctuation: 'yes.', 'ok!', 'sure?', 'correct.'\n\n"
+                    "- With punctuation: 'yes.', 'ok!', 'sure?', 'correct.', 'yup!', 'yess.'\n\n"
                     "NON-AFFIRMATIVE (should return NEGATIVE):\n"
                     "- Field corrections: 'name is John', 'IC should be 123456', 'address is wrong'\n"
                     "- Questions: 'what about...', 'how do I...', 'can you...'\n"
@@ -2484,6 +2484,8 @@ def lambda_handler(event, context):
                     "- 'correct, proceed' → AFFIRMATIVE\n"
                     "- 'ya betul.' → AFFIRMATIVE\n"
                     "- 'looks good!' → AFFIRMATIVE\n"
+                    "- 'yup' → AFFIRMATIVE\n"
+                    "- 'yess!' → AFFIRMATIVE\n"
                     "- 'name is John Smith' → NEGATIVE\n"
                     "- 'IC should be 123456' → NEGATIVE\n"
                     "- 'what about the address?' → NEGATIVE\n\n"
