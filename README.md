@@ -10,7 +10,7 @@ JSON payload with the following structure:
 ```json
 {
   "message": "User message or service request",
-  "userId": "Malaysian IC number (e.g., 041223070745)",
+  "userId": "Malaysian IC number (e.g., 010203040506)",
   "createdAt": "ISO 8601 timestamp (e.g., 2025-10-02T01:03:00.000Z)",
   "sessionId": "Session identifier or '(new-session)'",
   "attachment": [],
